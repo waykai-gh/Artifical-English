@@ -1,0 +1,30 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: english
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-english_local_only}
+      POSTGRES_DB: english
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-15432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U english -d english"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+  bot:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://english:${POSTGRES_PASSWORD:-english_local_only}@db:5432/english
+    depends_on:
+      db:
+        condition: service_healthy
+    init: true
+    stop_grace_period: 300s
+    restart: unless-stopped
+volumes:
+  postgres_data:

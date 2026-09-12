@@ -1,0 +1,165 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { PGlite } from '@electric-sql/pglite';
+import { commands, createBot } from '../src/bot.js';
+import { UserError } from '../src/domain.js';
+import type { Store } from '../src/storage.js';
+import { answer, testConfig, testStore, vocabularyUsage } from './helpers.js';
+
+describe('Telegram conversation flow', () => {
+  let db: PGlite;
+  let store: Store;
+  beforeEach(async () => { ({ db, store } = await testStore()); });
+  afterEach(async () => { await db.close(); });
+
+  async function setup(extra: NodeJS.ProcessEnv = {}) {
+    const sent: string[] = [];
+    const edited: string[] = [];
+    const ai = {
+      chat: vi.fn().mockResolvedValue({ answer, provider: 'groq' as const }),
+      explainVocabulary: vi.fn().mockResolvedValue({ usage: vocabularyUsage, provider: 'groq' as const }),
+    };
+    const speech = { canTranscribe: true, canSpeak: true, speak: vi.fn().mockResolvedValue(Buffer.from('voice')), transcribe: vi.fn().mockResolvedValue('Hello') };
+    const bot = createBot(testConfig({ REQUEST_COOLDOWN_SECONDS: '0', ...extra }), { store, ai, speech, logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } });
+    bot.api.config.use(async (_prev, method, payload) => {
+      if (method === 'sendMessage' && 'text' in payload) sent.push(String(payload.text));
+      if (method === 'editMessageText' && 'text' in payload) edited.push(String(payload.text));
+      if (method === 'getMe') return { ok: true, result: { id: 123456, is_bot: true, first_name: 'Ellie', username: 'TestEllieBot', can_join_groups: false, can_read_all_group_messages: false, supports_inline_queries: false } };
+      return { ok: true, result: true } as Awaited<ReturnType<typeof _prev>>;
+    });
+    await bot.init();
+    const send = (text: string, update = 1, userId = 1, chatType: 'private' | 'group' = 'private') => bot.handleUpdate({
+      update_id: update,
+      message: { message_id: update, date: 1, chat: chatType === 'private' ? { id: userId, type: 'private', first_name: 'Learner' } : { id: -1, type: 'group', title: 'Group' },
+        from: { id: userId, is_bot: false, first_name: 'Learner' }, text,
+        ...(text.startsWith('/') ? { entities: [{ type: 'bot_command' as const, offset: 0, length: text.split(' ')[0]!.length }] } : {}),
+      },
+    });
+    const click = (data: string, update = 100, userId = 1) => bot.handleUpdate({
+      update_id: update,
+      callback_query: {
+        id: `callback-${update}`,
+        from: { id: userId, is_bot: false, first_name: 'Learner' },
+        chat_instance: 'test-chat', data,
+        message: { message_id: 500 + update, date: 1, chat: { id: userId, type: 'private', first_name: 'Learner' },
+          from: { id: 123456, is_bot: true, first_name: 'Ellie' }, text: 'menu' },
+      },
+    });
+    return { bot, sent, edited, ai, speech, send, click };
+  }
+
+  it('publishes only the two entry commands', () => {
+    expect(commands.map(command => command.command)).toEqual(['start', 'menu']);
+  });
+
+  it('answers, explains mistakes, remembers the next turn, and ignores duplicate updates', async () => {
+    const h = await setup();
+    await h.send('Yesterday I go to the shop.');
+    expect(h.sent[0]).toContain(answer.reply);
+    expect(h.sent[0]).toContain('Разбор ошибок');
+    expect(h.sent[0]).toContain('Past Simple');
+    await h.send('Yesterday I go to the shop.');
+    expect(h.ai.chat).toHaveBeenCalledTimes(1);
+    await h.send('I bought coffee.', 2);
+    expect(h.ai.chat.mock.calls[1]![0].history).toHaveLength(2);
+    expect(h.speech.speak).not.toHaveBeenCalled();
+  });
+
+  it('keeps text and history when speech synthesis fails', async () => {
+    const h = await setup();
+    await h.send('/voice on', 1);
+    h.speech.speak.mockRejectedValue(new Error('speech unavailable'));
+    await h.send('Yesterday I go to the shop.', 2);
+    expect(h.sent.join('\n')).toContain('озвучка сейчас недоступна');
+    expect(await store.stats(1)).toEqual({ turns: 1, corrections: 1, vocabulary: 0 });
+  });
+
+  it('does not persist a failed provider turn and lets the user retry', async () => {
+    const h = await setup();
+    h.ai.chat.mockRejectedValueOnce(new UserError('Try later'));
+    await h.send('hello');
+    expect(h.sent).toContain('Try later');
+    expect(await store.history(1)).toEqual([]);
+    await h.send('hello', 2);
+    expect(await store.hasTurn(1, 2)).toBe(true);
+  });
+
+  it('serializes simultaneous messages so the second sees the first in history', async () => {
+    const h = await setup();
+    await Promise.all([h.send('first', 1), h.send('second', 2)]);
+    expect(h.ai.chat.mock.calls[1]![0].history[0].content).toBe('first');
+  });
+
+  it('applies settings, forgets user data, and never sends commands to the model', async () => {
+    const h = await setup();
+    await h.send('/level A2');
+    await h.send('/corrections off', 2);
+    expect((await store.settings(1)).level).toBe('A2');
+    expect((await store.settings(1)).corrections).toBe('off');
+    await h.send('/unknown', 3);
+    await h.send('/forget', 4);
+    expect(h.ai.chat).not.toHaveBeenCalled();
+    expect((await db.query('SELECT * FROM app_users')).rows).toEqual([]);
+  });
+
+  it('saves, lists, explains, updates and deletes vocabulary without polluting chat history', async () => {
+    const h = await setup();
+    await h.send('/save take off | взлетать', 1);
+    expect(h.sent.at(-1)).toContain('Сохранено');
+    const item = await store.findVocabulary(1, 'take off');
+    expect(item?.translation).toBe('взлетать');
+    await h.send('/save TAKE OFF | взлетать, снимать', 2);
+    expect((await store.listVocabulary(1, 1)).total).toBe(1);
+    await h.send('/words', 3);
+    expect(h.sent.at(-1)).toContain('TAKE OFF — взлетать, снимать');
+    await h.send(`/word ${item!.id}`, 4);
+    expect(h.ai.explainVocabulary).toHaveBeenCalledWith(expect.objectContaining({ term: 'TAKE OFF', translation: 'взлетать, снимать' }));
+    expect(h.sent.at(-1)).toContain('The plane took off on time.');
+    expect(await store.history(1)).toEqual([]);
+    await h.send(`/delword ${item!.id}`, 5);
+    expect(await store.findVocabulary(1, 'take off')).toBeNull();
+  });
+
+  it('rejects malformed vocabulary commands and missing entries without calling AI', async () => {
+    const h = await setup();
+    await h.send('/save take off', 1);
+    expect(h.sent.at(-1)).toContain('Формат');
+    await h.send('/word 999', 2);
+    expect(h.sent.at(-1)).toContain('нет');
+    await h.send('/delword nope', 3);
+    expect(h.sent.at(-1)).toContain('номер');
+    expect(h.ai.explainVocabulary).not.toHaveBeenCalled();
+  });
+
+  it('opens menu and settings through callback buttons, then saves a word through the guided flow', async () => {
+    const h = await setup();
+    await h.click('ui:menu', 1);
+    expect(h.edited.at(-1)).toContain('Твоя практика английского');
+    await h.click('ui:settings', 2);
+    expect(h.edited.at(-1)).toContain('Настройки под тебя');
+    await h.click('ui:settings:level', 3);
+    expect(h.edited.at(-1)).toContain('Насколько сложным');
+    await h.click('ui:set:level:A2', 4);
+    expect((await store.settings(1)).level).toBe('A2');
+    await h.click('ui:words:1', 5);
+    await h.click('ui:add', 6);
+    expect(h.sent.at(-1)).toContain('английское слово');
+    await h.send('take off', 7);
+    expect(h.sent.at(-1)).toContain('перевод');
+    await h.send('взлетать', 8);
+    expect(h.sent.at(-1)).toContain('Сохранено');
+    expect((await store.listVocabulary(1, 1)).total).toBe(1);
+  });
+
+  it('allows private users by default, ignores groups, and supports an optional allowlist', async () => {
+    const h = await setup();
+    await h.send('hello', 1, 99);
+    expect(h.ai.chat).toHaveBeenCalledTimes(1);
+    await h.send('group text', 2, 99, 'group');
+    expect(h.ai.chat).toHaveBeenCalledTimes(1);
+    const privateBot = await setup({ PUBLIC_BOT: 'false', ALLOWED_USER_IDS: '1' });
+    await privateBot.send('/id', 3, 99);
+    expect(privateBot.sent[0]).toContain('99');
+    await privateBot.send('hello', 4, 99);
+    expect(privateBot.ai.chat).not.toHaveBeenCalled();
+  });
+});
