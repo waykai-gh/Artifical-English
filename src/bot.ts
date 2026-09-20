@@ -2,21 +2,20 @@ import { Bot, Context, GrammyError, InlineKeyboard, InputFile } from 'grammy';
 import { sequentialize } from '@grammyjs/runner';
 import type { Logger } from 'pino';
 import type { Config } from './config.js';
-import { correctionsSchema, languageSchema, levelSchema, UserError, voiceSchema, type Settings } from './domain.js';
+import { correctionsSchema, guardTutorInput, languageSchema, levelSchema, UserError, voiceSchema, type Settings } from './domain.js';
 import { formatAnswer, formatVocabularyUsage, splitText } from './format.js';
 import { requestBytes } from './ai/http.js';
 import type { AiRouter } from './ai/router.js';
-import type { Store } from './storage.js';
+import type { AdminTurn, AdminUserRecord, OperationsStats, Store, VocabularyItem } from './storage.js';
 import type { SpeechService } from './speech.js';
 import { createPending, type PendingAction } from './ui-state.js';
 import { repairPrivateChatMenu, publicCommands } from './telegram-setup.js';
 import type { BotDependencies } from './dependencies.js';
-import type { OperationsStats } from './storage.js';
-import { consentDeclinedScreen, consentScreen, dataScreen, dictionaryScreen, guideScreen, levelOnboardingScreen, mainMenuScreen, menuKeyboard, settingsChoiceScreen, settingsScreen, topicsScreen, vocabularyScreen, welcomeScreen, confirmScreen, type SettingsSection } from './ui/screens.js';
+import { consentDeclinedScreen, consentScreen, dataScreen, dictionaryScreen, guideScreen, levelOnboardingScreen, mainMenuScreen, menuKeyboard, settingsChoiceScreen, settingsScreen, topicsScreen, vocabularyScreen, welcomeScreen, confirmScreen, type Screen, type SettingsSection } from './ui/screens.js';
 import { showScreen } from './ui/messages.js';
 
 export const commands = publicCommands;
-export const CONSENT_VERSION = '2026-09-20';
+export const CONSENT_VERSION = '2026-09-20.2';
 
 export function operationsText(stats: OperationsStats, c: Config): string {
   const providerLines = stats.providersToday.length
@@ -51,10 +50,57 @@ function privacyText(c: Config): string {
 • Словарь — пока ты не удалишь записи или все данные.
 
 Тексты и расшифровки передаются AI-сервису для ответа; Telegram ID туда не передаётся. В контекст попадают до ${c.HISTORY_TURNS} последних пар сообщений. Аудиофайлы в базе не хранятся.
+Владелец бота может просматривать сохранённые настройки, словарь и последние реплики для поддержки. Доступ есть только у владельца.
 
 /forget удаляет данные из базы бота, но не копии Telegram, резервные копии или уже обработанные данные внешних сервисов.
 
 Продукт создан с помощью ИИ; ответы могут содержать ошибки.`;
+}
+
+function adminDashboardScreen(stats: OperationsStats, c: Config): Screen {
+  return { text: operationsText(stats, c), keyboard: new InlineKeyboard().text('👥 Пользователи', 'admin:users:1') };
+}
+
+function adminUsersScreen(result: { items: AdminUserRecord[]; total: number; pages: number; page: number }): Screen {
+  const keyboard = new InlineKeyboard();
+  for (const user of result.items) keyboard.text(`${user.id} · ${user.settings.level} · ${user.turns} репл.`, `admin:user:${user.id}:${result.page}`).row();
+  if (result.pages > 1) {
+    if (result.page > 1) keyboard.text('‹', `admin:users:${result.page - 1}`);
+    keyboard.text(`${result.page}/${result.pages}`, `admin:users:${result.page}`);
+    if (result.page < result.pages) keyboard.text('›', `admin:users:${result.page + 1}`);
+    keyboard.row();
+  }
+  keyboard.text('‹ Статистика', 'admin:dashboard');
+  const rows = result.items.length ? result.items.map(user => `• <code>${user.id}</code> · ${user.settings.level} · активен ${formatAdminTime(user.lastActive)}`).join('\n') : 'Пользователей пока нет.';
+  return { text: `<b>Пользователи · ${result.total}</b>\n\n${rows}\n\nМожно также ввести /admin Telegram_ID.`, keyboard };
+}
+
+function adminUserScreen(user: AdminUserRecord, page: number): Screen {
+  const consent = user.consentedAt ? `${formatAdminTime(user.consentedAt)} · ${escapeHtmlForBot(user.consentVersion ?? 'версия не указана')}` : 'не принято';
+  return {
+    text: `<b>Пользователь <code>${user.id}</code></b>\n\nСоздан: ${formatAdminTime(user.createdAt)}\nПоследняя активность: ${formatAdminTime(user.lastActive)}\nСогласие: ${consent}\nОнбординг: ${user.onboardingCompleted ? 'пройден' : 'не пройден'}\n\nУровень: ${user.settings.level}\nИсправления: ${user.settings.corrections}\nЯзык объяснений: ${user.settings.explanationLanguage}\nГолос: ${user.settings.voiceMode}\n\nРеплики: ${user.turns}\nСловарь: ${user.vocabulary}`,
+    keyboard: new InlineKeyboard().text('💬 Последние реплики', `admin:history:${user.id}:${page}`).row()
+      .text('📚 Словарь', `admin:words:${user.id}:${page}`).row().text('‹ Пользователи', `admin:users:${page}`),
+  };
+}
+
+function adminHistoryScreen(userId: number, turns: AdminTurn[], page: number): Screen {
+  const rows = turns.length ? turns.map(turn => `<b>${formatAdminTime(turn.createdAt)}</b>\nПользователь: ${escapeHtmlForBot(shortAdminText(turn.userText))}\nEllie: ${escapeHtmlForBot(shortAdminText(turn.reply))}\n${escapeHtmlForBot(turn.provider)} · исправлений: ${turn.corrections}`).join('\n\n') : 'Сохранённых реплик нет.';
+  return { text: `<b>Последние реплики · <code>${userId}</code></b>\n\n${rows}`, keyboard: new InlineKeyboard().text('‹ К пользователю', `admin:user:${userId}:${page}`) };
+}
+
+function adminVocabularyScreen(userId: number, data: { items: VocabularyItem[]; total: number }, page: number): Screen {
+  const rows = data.items.length ? data.items.map(item => `• ${escapeHtmlForBot(shortAdminText(item.term, 70))} — ${escapeHtmlForBot(shortAdminText(item.translation, 120))}`).join('\n') : 'Словарь пуст.';
+  return { text: `<b>Словарь · <code>${userId}</code> · ${data.total}</b>\n\n${rows}${data.total > data.items.length ? `\n\nПоказаны последние ${data.items.length}.` : ''}`, keyboard: new InlineKeyboard().text('‹ К пользователю', `admin:user:${userId}:${page}`) };
+}
+
+function formatAdminTime(iso: string): string {
+  return `${iso.slice(0, 16).replace('T', ' ')} UTC`;
+}
+
+function shortAdminText(value: string, limit = 260): string {
+  const chars = Array.from(value);
+  return chars.length > limit ? `${chars.slice(0, limit - 1).join('')}…` : value;
 }
 
 export type { BotDependencies } from './dependencies.js';
@@ -89,7 +135,39 @@ export function createBot(c: Config, deps: BotDependencies): Bot {
 
   bot.command('admin', async ctx => {
     if (!admins.has(String(ctx.from!.id))) { await ctx.reply('Команда недоступна.'); return; }
-    await ctx.reply(operationsText(await store.operationsStats(), c));
+    const reference = ctx.match.trim();
+    if (reference) {
+      const userId = Number(reference);
+      if (!/^\d+$/.test(reference) || !Number.isSafeInteger(userId) || userId < 1) { await ctx.reply('Формат: /admin Telegram_ID'); return; }
+      const user = await store.adminUser(userId);
+      if (!user) { await ctx.reply('Пользователь с таким Telegram ID не найден.'); return; }
+      await showScreen(ctx, adminUserScreen(user, 1));
+      return;
+    }
+    await showScreen(ctx, adminDashboardScreen(await store.operationsStats(), c));
+  });
+
+  bot.on('callback_query:data', async (ctx, next) => {
+    const data = ctx.callbackQuery.data;
+    if (!data.startsWith('admin:')) { await next(); return; }
+    await ctx.answerCallbackQuery().catch(() => undefined);
+    if (!admins.has(String(ctx.from!.id))) { await ctx.reply('Команда недоступна.'); return; }
+    const [, action, arg, extra] = data.split(':');
+    if (action === 'dashboard') { await showScreen(ctx, adminDashboardScreen(await store.operationsStats(), c)); return; }
+    if (action === 'users') {
+      const page = Number(arg ?? '1');
+      if (!Number.isSafeInteger(page) || page < 1) return;
+      await showScreen(ctx, adminUsersScreen(await store.adminUsers(page)));
+      return;
+    }
+    const userId = Number(arg);
+    const page = Number(extra ?? '1');
+    if (!Number.isSafeInteger(userId) || userId < 1 || !Number.isSafeInteger(page) || page < 1) return;
+    const user = await store.adminUser(userId);
+    if (!user) { await showScreen(ctx, { text: 'Пользователь больше не найден.', keyboard: new InlineKeyboard().text('‹ Пользователи', `admin:users:${page}`) }); return; }
+    if (action === 'user') { await showScreen(ctx, adminUserScreen(user, page)); return; }
+    if (action === 'history') { await showScreen(ctx, adminHistoryScreen(userId, await store.adminRecentTurns(userId, 5), page)); return; }
+    if (action === 'words') { await showScreen(ctx, adminVocabularyScreen(userId, await store.adminVocabulary(userId, 15), page)); }
   });
 
   bot.use(async (ctx, next) => {
@@ -221,7 +299,10 @@ export function createBot(c: Config, deps: BotDependencies): Bot {
     if (action === 'consent') {
       if (arg === 'accept') {
         await store.acceptConsent(userId, CONSENT_VERSION);
-        await showScreen(ctx, levelOnboardingScreen());
+        if (await store.onboardingCompleted(userId)) {
+          const settings = await store.settings(userId);
+          await showScreen(ctx, welcomeScreen((await store.getUiState(userId)).conversationCount > 0, settings.level));
+        } else await showScreen(ctx, levelOnboardingScreen());
       } else if (arg === 'decline') {
         await store.forget(userId);
         await showScreen(ctx, consentDeclinedScreen());
@@ -452,19 +533,23 @@ export function createBot(c: Config, deps: BotDependencies): Bot {
         await replyLong(ctx, `🎧 Я услышала:\n${text}`);
       }
       if (!text) throw new UserError('Напиши сообщение или запиши голосовое с речью.');
-      const result = await ai.chat({ settings, history: await store.history(userId), text, fromVoice: Boolean(audio) });
+      const input = { settings, history: await store.history(userId), text, fromVoice: Boolean(audio) };
+      const guarded = guardTutorInput(input);
+      const result = guarded ? { answer: guarded, provider: 'local-scope-guard' } : await ai.chat(input);
       await replyLong(ctx, formatAnswer(result.answer, settings, Boolean(audio)));
       // Save only after Telegram accepts the text. Telegram and PostgreSQL cannot commit atomically.
       await store.saveTurn(userId, ctx.update.update_id, text, result.answer, result.provider);
-      const conversationCount = await store.noteConversation(userId);
-      if (conversationCount === 1 && await store.markTipSeen(userId, 'vocabulary')) {
-        await ctx.reply('💡 Встретилась полезная фраза? Её можно сохранить в личный словарь и потом попросить примеры.', {
-          reply_markup: new InlineKeyboard().text('📚 Открыть словарь', 'ui:words:1'),
-        });
-      } else if (conversationCount === 3 && await store.markTipSeen(userId, 'settings')) {
-        await ctx.reply('⚙️ Можно настроить сложность и количество исправлений под себя.', {
-          reply_markup: new InlineKeyboard().text('Настроить', 'ui:settings'),
-        });
+      if (result.provider !== 'local-scope-guard') {
+        const conversationCount = await store.noteConversation(userId);
+        if (conversationCount === 1 && await store.markTipSeen(userId, 'vocabulary')) {
+          await ctx.reply('💡 Встретилась полезная фраза? Её можно сохранить в личный словарь и потом попросить примеры.', {
+            reply_markup: new InlineKeyboard().text('📚 Открыть словарь', 'ui:words:1'),
+          });
+        } else if (conversationCount === 3 && await store.markTipSeen(userId, 'settings')) {
+          await ctx.reply('⚙️ Можно настроить сложность и количество исправлений под себя.', {
+            reply_markup: new InlineKeyboard().text('Настроить', 'ui:settings'),
+          });
+        }
       }
       if (speech.canSpeak && (settings.voiceMode === 'on' || settings.voiceMode === 'auto' && audio)) {
         try {

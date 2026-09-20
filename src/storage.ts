@@ -100,6 +100,18 @@ export type OperationsStats = {
   vocabulary: { users: number; items: number };
   providersToday: ProviderOperations[];
 };
+export type AdminUserRecord = {
+  id: number;
+  settings: Settings;
+  createdAt: string;
+  consentedAt: string | null;
+  consentVersion: string | null;
+  onboardingCompleted: boolean;
+  turns: number;
+  vocabulary: number;
+  lastActive: string;
+};
+export type AdminTurn = { userText: string; reply: string; corrections: number; provider: string; createdAt: string };
 
 export function createPool(connectionString: string) {
   return new Pool({ connectionString, max: 5, connectionTimeoutMillis: 5000, idleTimeoutMillis: 30000, statement_timeout: 10000 });
@@ -375,6 +387,50 @@ export class Store {
       })),
     };
   }
+
+  async adminUsers(page: number, pageSize = 8): Promise<{ items: AdminUserRecord[]; total: number; pages: number; page: number }> {
+    if (!Number.isSafeInteger(page) || !Number.isSafeInteger(pageSize) || page < 1 || pageSize < 1 || pageSize > 20) throw new Error('Invalid admin pagination');
+    const count = await this.db.query('SELECT count(*)::int AS total FROM app_users');
+    const total = Number(count.rows[0]?.total ?? 0);
+    const pages = Math.max(1, Math.ceil(total / pageSize));
+    const normalizedPage = Math.min(page, pages);
+    const result = await this.db.query(`SELECT u.id, u.settings, u.created_at, u.consented_at, u.consent_version, u.onboarding_completed,
+      (SELECT count(*)::int FROM turns t WHERE t.user_id = u.id) AS turns,
+      (SELECT count(*)::int FROM vocabulary_items v WHERE v.user_id = u.id) AS vocabulary,
+      coalesce((SELECT max(t.created_at) FROM turns t WHERE t.user_id = u.id), u.created_at) AS last_active
+      FROM app_users u ORDER BY last_active DESC, u.id DESC LIMIT $1 OFFSET $2`, [pageSize, (normalizedPage - 1) * pageSize]);
+    return { items: result.rows.map(adminUserRecord), total, pages, page: normalizedPage };
+  }
+
+  async adminUser(userId: number): Promise<AdminUserRecord | null> {
+    const result = await this.db.query(`SELECT u.id, u.settings, u.created_at, u.consented_at, u.consent_version, u.onboarding_completed,
+      (SELECT count(*)::int FROM turns t WHERE t.user_id = u.id) AS turns,
+      (SELECT count(*)::int FROM vocabulary_items v WHERE v.user_id = u.id) AS vocabulary,
+      coalesce((SELECT max(t.created_at) FROM turns t WHERE t.user_id = u.id), u.created_at) AS last_active
+      FROM app_users u WHERE u.id = $1`, [userId]);
+    return result.rows[0] ? adminUserRecord(result.rows[0]) : null;
+  }
+
+  async adminRecentTurns(userId: number, limit = 5): Promise<AdminTurn[]> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10) throw new Error('Invalid admin history limit');
+    const result = await this.db.query(`SELECT user_text, answer, provider, created_at FROM turns
+      WHERE user_id = $1 ORDER BY id DESC LIMIT $2`, [userId, limit]);
+    return result.rows.reverse().map(row => {
+      const answer = answerSchema.parse(row.answer);
+      return { userText: String(row.user_text), reply: answer.reply, corrections: answer.corrections.length,
+        provider: String(row.provider), createdAt: isoTime(row.created_at) };
+    });
+  }
+
+  async adminVocabulary(userId: number, limit = 20): Promise<{ items: VocabularyItem[]; total: number }> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50) throw new Error('Invalid admin vocabulary limit');
+    const [count, result] = await Promise.all([
+      this.db.query('SELECT count(*)::int AS total FROM vocabulary_items WHERE user_id = $1', [userId]),
+      this.db.query(`SELECT id, term, translation FROM vocabulary_items
+        WHERE user_id = $1 ORDER BY updated_at DESC, id DESC LIMIT $2`, [userId, limit]),
+    ]);
+    return { items: result.rows.map(vocabularyItem), total: Number(count.rows[0]?.total ?? 0) };
+  }
 }
 
 function normalizeSpaces(value: string): string {
@@ -386,4 +442,26 @@ function vocabularyItem(row: Record<string, unknown> | undefined): VocabularyIte
   const id = Number(row.id);
   if (!Number.isSafeInteger(id) || id < 1) throw new Error('Invalid vocabulary item ID');
   return { id, term: String(row.term), translation: String(row.translation) };
+}
+
+function adminUserRecord(row: Record<string, unknown>): AdminUserRecord {
+  const id = Number(row.id);
+  if (!Number.isSafeInteger(id) || id < 1) throw new Error('Invalid admin user ID');
+  return {
+    id,
+    settings: settingsSchema.parse(row.settings),
+    createdAt: isoTime(row.created_at),
+    consentedAt: row.consented_at == null ? null : isoTime(row.consented_at),
+    consentVersion: row.consent_version == null ? null : String(row.consent_version),
+    onboardingCompleted: row.onboarding_completed === true,
+    turns: Number(row.turns ?? 0),
+    vocabulary: Number(row.vocabulary ?? 0),
+    lastActive: isoTime(row.last_active),
+  };
+}
+
+function isoTime(value: unknown): string {
+  const date = value instanceof Date ? value : new Date(String(value));
+  if (!Number.isFinite(date.getTime())) throw new Error('Invalid timestamp');
+  return date.toISOString();
 }

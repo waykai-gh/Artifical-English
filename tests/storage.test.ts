@@ -119,6 +119,21 @@ describe('PostgreSQL persistence', () => {
     expect(await store.providerDayUsage('groq')).toEqual({ requests: 2, inputTokens: 1200, outputTokens: 100 });
   });
 
+  it('provides paginated support views without exposing PostgreSQL publicly', async () => {
+    await store.settings(1); await store.settings(2);
+    await store.updateSettings(2, { level: 'A1' });
+    await store.saveTurn(2, 1, 'hello', answer, 'groq');
+    await store.saveVocabulary(2, 'take off', 'взлетать');
+    const users = await store.adminUsers(1, 1);
+    expect(users.total).toBe(2);
+    expect(users.pages).toBe(2);
+    const detail = await store.adminUser(2);
+    expect(detail).toEqual(expect.objectContaining({ id: 2, turns: 1, vocabulary: 1, settings: expect.objectContaining({ level: 'A1' }) }));
+    expect(await store.adminUser(999)).toBeNull();
+    expect(await store.adminRecentTurns(2)).toEqual([expect.objectContaining({ userText: 'hello', reply: answer.reply, provider: 'groq' })]);
+    expect(await store.adminVocabulary(2)).toEqual({ total: 1, items: [expect.objectContaining({ term: 'take off', translation: 'взлетать' })] });
+  });
+
   it('excludes expired turns before cleanup and deletes all user data on forget', async () => {
     await store.settings(1); await store.settings(2);
     await store.saveTurn(1, 1, 'expired', answer, 'groq');
