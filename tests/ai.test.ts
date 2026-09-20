@@ -28,6 +28,12 @@ describe('tutor output and settings', () => {
     expect(prompt).toContain('detailed');
     expect(prompt).toContain('cannot assess pronunciation');
   });
+  it('uses Russian-first scaffolding for a complete beginner', () => {
+    const prompt = buildPrompt({ ...input.settings, level: 'A0' }, false);
+    expect(prompt).toContain('complete beginner');
+    expect(prompt).toContain('Reply primarily in Russian');
+    expect(prompt).toContain('pronunciation hint in Cyrillic');
+  });
   it('supports existing keys without allowing arbitrary credential destinations', () => {
     const c = readConfig({ BOT_TOKEN: `123456:${'x'.repeat(35)}`, DATABASE_URL: 'postgresql://localhost/test',
       LLM_PROVIDER_NAME: 'groq', LLM_API_KEY: 'old-groq', LLM_MODEL: 'openai/gpt-oss-120b',
@@ -89,6 +95,17 @@ describe('provider routing', () => {
   it('returns an actionable error when all providers fail', async () => {
     const router = new AiRouter([{ name: 'groq', chat: async () => { throw new ProviderError(401); }, explainVocabulary: async () => { throw new ProviderError(401); } }], { warn: vi.fn() });
     await expect(router.chat(input)).rejects.toBeInstanceOf(UserError);
+  });
+  it('reports provider attempts, fallback failures and token usage to operations monitoring', async () => {
+    const observer = { onAiAttempt: vi.fn(), onAiExhausted: vi.fn() };
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response('', { status: 429 }))
+      .mockResolvedValueOnce(Response.json({ candidates: [{ content: { parts: [{ text: JSON.stringify(answer) }] }, finishReason: 'STOP' }], usageMetadata: { promptTokenCount: 321, candidatesTokenCount: 45 } }));
+    const router = new AiRouter(createProviders(testConfig({ GEMINI_API_KEY: 'gemini-test' }), fetcher), { warn: vi.fn() }, Date.now, observer);
+    expect((await router.chat(input)).provider).toBe('gemini');
+    expect(observer.onAiAttempt).toHaveBeenNthCalledWith(1, expect.objectContaining({ provider: 'groq', outcome: 'failure', statusCode: 429 }));
+    expect(observer.onAiAttempt).toHaveBeenNthCalledWith(2, expect.objectContaining({ provider: 'gemini', outcome: 'success', usage: { inputTokens: 321, outputTokens: 45 } }));
+    expect(observer.onAiExhausted).not.toHaveBeenCalled();
   });
 });
 

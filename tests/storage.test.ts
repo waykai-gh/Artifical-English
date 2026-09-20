@@ -9,6 +9,19 @@ describe('PostgreSQL persistence', () => {
   beforeEach(async () => { ({ db, store } = await testStore(2)); });
   afterEach(async () => { await db.close(); });
 
+  it('records consent separately and never onboards a user without it', async () => {
+    expect(await store.hasConsent(1, 'v1')).toBe(false);
+    await expect(store.completeOnboarding(1, 'A0')).rejects.toThrow('Consent is required');
+    expect((await db.query('SELECT * FROM app_users')).rows).toEqual([]);
+    await store.acceptConsent(1, 'v1');
+    expect(await store.hasConsent(1, 'v1')).toBe(true);
+    expect(await store.hasConsent(1, 'v2')).toBe(false);
+    expect(await store.onboardingCompleted(1)).toBe(false);
+    await store.completeOnboarding(1, 'A0');
+    expect(await store.onboardingCompleted(1)).toBe(true);
+    expect((await store.settings(1)).level).toBe('A0');
+  });
+
   it('isolates users, orders and bounds history, and deduplicates updates', async () => {
     await store.settings(1); await store.settings(2);
     for (let id = 1; id <= 3; id++) await store.saveTurn(1, id, `message ${id}`, answer, 'groq');
@@ -84,6 +97,26 @@ describe('PostgreSQL persistence', () => {
     await db.query("UPDATE request_usage SET day = day - 1, last_request = now() - interval '1 day' WHERE user_id = 1");
     expect(await store.claimRequest(1, 1, 0)).toBe(true);
     expect(await store.claimRequest(1, 100, 10)).toBe(false);
+  });
+
+  it('aggregates operator activity and AI health without storing message-level analytics', async () => {
+    await store.settings(1); await store.settings(2); await store.settings(3);
+    await store.saveTurn(1, 1, 'hello', answer, 'groq');
+    await store.saveTurn(1, 2, 'again', answer, 'groq');
+    await store.saveTurn(1, 3, 'third', answer, 'groq');
+    await store.saveTurn(2, 4, 'hello', answer, 'cloudflare');
+    await db.query("UPDATE turns SET created_at = now() - interval '1 day' WHERE user_id = 1 AND update_id = 1");
+    await store.saveVocabulary(1, 'take off', 'взлетать');
+    await store.recordAiAttempt({ provider: 'groq', feature: 'chat', outcome: 'success', statusCode: 0, durationMs: 500, usage: { inputTokens: 1200, outputTokens: 100 } });
+    await store.recordAiAttempt({ provider: 'groq', feature: 'chat', outcome: 'failure', statusCode: 429, durationMs: 100, usage: { inputTokens: 0, outputTokens: 0 } });
+    const stats = await store.operationsStats();
+    expect(stats.users.total).toBe(3);
+    expect(stats.activity.active7d).toBe(2);
+    expect(stats.activity.engaged7d).toBe(1);
+    expect(stats.activity.returning7d).toBe(1);
+    expect(stats.vocabulary).toEqual({ users: 1, items: 1 });
+    expect(stats.providersToday[0]).toEqual(expect.objectContaining({ provider: 'groq', attempts: 2, failures: 1, averageMs: 300, inputTokens: 1200, outputTokens: 100 }));
+    expect(await store.providerDayUsage('groq')).toEqual({ requests: 2, inputTokens: 1200, outputTokens: 100 });
   });
 
   it('excludes expired turns before cleanup and deletes all user data on forget', async () => {

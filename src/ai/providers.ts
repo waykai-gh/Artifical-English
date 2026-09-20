@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import type { Config } from '../config.js';
-import { buildPrompt, buildVocabularyPrompt, parseAnswer, parseVocabularyUsage, type Answer, type ChatInput, type Message, type ProviderName, type VocabularyInput, type VocabularyUsage } from '../domain.js';
+import { buildPrompt, buildVocabularyPrompt, parseAnswer, parseVocabularyUsage, type Answer, type ChatInput, type Message, type ProviderName, type TokenUsage, type VocabularyInput, type VocabularyUsage } from '../domain.js';
 import { requestJson, type Fetcher } from './http.js';
 
 export interface ChatProvider {
@@ -12,12 +12,31 @@ export interface ChatProvider {
 const chatResponse = z.object({ choices: z.array(z.object({
   message: z.object({ content: z.string() }),
   finish_reason: z.string().nullish(),
-})).min(1) });
+})).min(1), usage: z.object({
+  prompt_tokens: z.number().int().nonnegative().optional(),
+  completion_tokens: z.number().int().nonnegative().optional(),
+}).optional() });
 
 const geminiResponse = z.object({ candidates: z.array(z.object({
   content: z.object({ parts: z.array(z.object({ text: z.string().optional(), thought: z.boolean().optional() })) }),
   finishReason: z.string().optional(),
-})).min(1) });
+})).min(1), usageMetadata: z.object({
+  promptTokenCount: z.number().int().nonnegative().optional(),
+  candidatesTokenCount: z.number().int().nonnegative().optional(),
+}).optional() });
+
+const usageSymbol = Symbol('provider-token-usage');
+type ValueWithUsage = object & { [usageSymbol]?: TokenUsage };
+
+function withUsage<T extends object>(value: T, usage: TokenUsage): T {
+  Object.defineProperty(value, usageSymbol, { value: usage, enumerable: false });
+  return value;
+}
+
+export function providerUsage(value: unknown): TokenUsage {
+  if (!value || typeof value !== 'object') return { inputTokens: 0, outputTokens: 0 };
+  return (value as ValueWithUsage)[usageSymbol] ?? { inputTokens: 0, outputTokens: 0 };
+}
 
 export function geminiText(raw: unknown): string {
   const first = geminiResponse.parse(raw).candidates[0]!;
@@ -30,7 +49,7 @@ export function createProviders(c: Config, fetcher: Fetcher = fetch): ChatProvid
   for (const name of c.AI_PROVIDER_ORDER) {
     const key = { groq: c.GROQ_API_KEY, cloudflare: c.CLOUDFLARE_API_TOKEN, gemini: c.GEMINI_API_KEY, openrouter: c.OPENROUTER_API_KEY }[name];
     if (!key) continue;
-    const completeJson = async (system: string, messages: Message[]): Promise<string> => {
+    const completeJson = async (system: string, messages: Message[]): Promise<{ text: string; usage: TokenUsage }> => {
       if (name === 'gemini') {
         const raw = await requestJson(fetcher,
           `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(c.GEMINI_CHAT_MODEL)}:generateContent`, {
@@ -41,7 +60,14 @@ export function createProviders(c: Config, fetcher: Fetcher = fetch): ChatProvid
               generationConfig: { responseMimeType: 'application/json', maxOutputTokens: 4096 },
             }),
           }, c.PROVIDER_TIMEOUT_MS);
-        return geminiText(raw);
+        const parsed = geminiResponse.parse(raw);
+        return {
+          text: geminiText(raw),
+          usage: {
+            inputTokens: parsed.usageMetadata?.promptTokenCount ?? 0,
+            outputTokens: parsed.usageMetadata?.candidatesTokenCount ?? 0,
+          },
+        };
       }
       const raw = await requestJson(fetcher, name === 'groq'
         ? 'https://api.groq.com/openai/v1/chat/completions'
@@ -56,18 +82,27 @@ export function createProviders(c: Config, fetcher: Fetcher = fetch): ChatProvid
           ...(name === 'groq' && c.GROQ_CHAT_MODEL.startsWith('openai/gpt-oss') ? { reasoning_effort: 'low' } : {}),
         }),
       }, c.PROVIDER_TIMEOUT_MS);
-      const first = chatResponse.parse(raw).choices[0]!;
+      const parsed = chatResponse.parse(raw);
+      const first = parsed.choices[0]!;
       if (first.finish_reason && first.finish_reason !== 'stop') throw new Error('Incomplete AI response');
-      return first.message.content;
+      return {
+        text: first.message.content,
+        usage: {
+          inputTokens: parsed.usage?.prompt_tokens ?? 0,
+          outputTokens: parsed.usage?.completion_tokens ?? 0,
+        },
+      };
     };
     providers.push({
       name,
       async chat(input) {
-        return parseAnswer(await completeJson(buildPrompt(input.settings, input.fromVoice), [...input.history, { role: 'user', content: input.text }]));
+        const result = await completeJson(buildPrompt(input.settings, input.fromVoice), [...input.history, { role: 'user', content: input.text }]);
+        return withUsage(parseAnswer(result.text), result.usage);
       },
       async explainVocabulary(input) {
         const data = JSON.stringify({ englishTerm: input.term, userTranslation: input.translation });
-        return parseVocabularyUsage(await completeJson(buildVocabularyPrompt(input.settings), [{ role: 'user', content: data }]));
+        const result = await completeJson(buildVocabularyPrompt(input.settings), [{ role: 'user', content: data }]);
+        return withUsage(parseVocabularyUsage(result.text), result.usage);
       },
     });
   }

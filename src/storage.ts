@@ -1,13 +1,19 @@
 import { Pool } from 'pg';
-import { answerSchema, settingsSchema, type Answer, type Message, type Settings } from './domain.js';
+import { answerSchema, settingsSchema, type AiAttempt, type Answer, type Message, type ProviderName, type Settings } from './domain.js';
 import { pendingActionSchema, type PendingAction, type UiState } from './ui-state.js';
 
 export const schemaSql = `
 CREATE TABLE IF NOT EXISTS app_users (
   id BIGINT PRIMARY KEY,
   settings JSONB NOT NULL,
+  consent_version TEXT,
+  consented_at TIMESTAMPTZ,
+  onboarding_completed BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE app_users ADD COLUMN IF NOT EXISTS consent_version TEXT;
+ALTER TABLE app_users ADD COLUMN IF NOT EXISTS consented_at TIMESTAMPTZ;
+ALTER TABLE app_users ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN NOT NULL DEFAULT FALSE;
 CREATE TABLE IF NOT EXISTS turns (
   id BIGSERIAL PRIMARY KEY,
   user_id BIGINT NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
@@ -43,6 +49,19 @@ CREATE TABLE IF NOT EXISTS app_ui_state (
   tip_flags JSONB NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(tip_flags) = 'array'),
   conversation_count INTEGER NOT NULL DEFAULT 0 CHECK (conversation_count >= 0)
 );
+CREATE TABLE IF NOT EXISTS ai_metrics_hourly (
+  bucket TIMESTAMPTZ NOT NULL,
+  provider TEXT NOT NULL,
+  feature TEXT NOT NULL,
+  outcome TEXT NOT NULL CHECK (outcome IN ('success', 'failure')),
+  status_code INTEGER NOT NULL DEFAULT 0,
+  requests INTEGER NOT NULL DEFAULT 0 CHECK (requests >= 0),
+  duration_ms BIGINT NOT NULL DEFAULT 0 CHECK (duration_ms >= 0),
+  input_tokens BIGINT NOT NULL DEFAULT 0 CHECK (input_tokens >= 0),
+  output_tokens BIGINT NOT NULL DEFAULT 0 CHECK (output_tokens >= 0),
+  PRIMARY KEY (bucket, provider, feature, outcome, status_code)
+);
+CREATE INDEX IF NOT EXISTS ai_metrics_hourly_bucket ON ai_metrics_hourly(bucket DESC);
 
 -- Separate commands inside a VOLATILE function take fresh READ COMMITTED
 -- snapshots after the user lock is acquired. A single count/insert CTE would
@@ -67,6 +86,20 @@ export interface Database {
 }
 
 export type VocabularyItem = { id: number; term: string; translation: string };
+export type ProviderOperations = {
+  provider: string;
+  attempts: number;
+  failures: number;
+  averageMs: number;
+  inputTokens: number;
+  outputTokens: number;
+};
+export type OperationsStats = {
+  users: { total: number; new24h: number; new7d: number };
+  activity: { active24h: number; active7d: number; active30d: number; turns24h: number; turns7d: number; engaged7d: number; returning7d: number };
+  vocabulary: { users: number; items: number };
+  providersToday: ProviderOperations[];
+};
 
 export function createPool(connectionString: string) {
   return new Pool({ connectionString, max: 5, connectionTimeoutMillis: 5000, idleTimeoutMillis: 30000, statement_timeout: 10000 });
@@ -87,6 +120,32 @@ export async function migrate(pool: Pool): Promise<void> {
 
 export class Store {
   constructor(private readonly db: Database, private readonly initial: Settings, private readonly historyTurns: number, private readonly retentionDays: number, private readonly historyMaxChars = 6000) {}
+
+  async hasConsent(userId: number, version: string): Promise<boolean> {
+    const result = await this.db.query('SELECT consent_version FROM app_users WHERE id = $1', [userId]);
+    return result.rows[0]?.consent_version === version;
+  }
+
+  async acceptConsent(userId: number, version: string): Promise<void> {
+    await this.db.query(`INSERT INTO app_users(id, settings, consent_version, consented_at)
+      VALUES ($1, $2::jsonb, $3, now())
+      ON CONFLICT (id) DO UPDATE SET consent_version = EXCLUDED.consent_version, consented_at = EXCLUDED.consented_at`,
+    [userId, JSON.stringify(this.initial), version]);
+  }
+
+  async onboardingCompleted(userId: number): Promise<boolean> {
+    const result = await this.db.query('SELECT onboarding_completed FROM app_users WHERE id = $1', [userId]);
+    return result.rows[0]?.onboarding_completed === true;
+  }
+
+  async completeOnboarding(userId: number, level: Settings['level']): Promise<Settings> {
+    const existing = await this.db.query('SELECT settings FROM app_users WHERE id = $1 AND consent_version IS NOT NULL', [userId]);
+    if (!existing.rows.length) throw new Error('Consent is required before onboarding');
+    const next = settingsSchema.parse({ ...settingsSchema.parse(existing.rows[0]?.settings), level });
+    const result = await this.db.query(`UPDATE app_users SET settings = $2::jsonb, onboarding_completed = TRUE
+      WHERE id = $1 AND consent_version IS NOT NULL RETURNING settings`, [userId, JSON.stringify(next)]);
+    return settingsSchema.parse(result.rows[0]?.settings);
+  }
 
   async settings(userId: number): Promise<Settings> {
     await this.db.query('INSERT INTO app_users(id, settings) VALUES ($1, $2::jsonb) ON CONFLICT DO NOTHING', [userId, JSON.stringify(this.initial)]);
@@ -239,6 +298,7 @@ export class Store {
     await this.db.query("DELETE FROM turns WHERE created_at <= now() - $1 * interval '1 day'", [this.retentionDays]);
     await this.db.query("DELETE FROM request_usage WHERE day < (now() AT TIME ZONE 'UTC')::date - 2");
     await this.db.query("UPDATE app_ui_state SET pending = NULL WHERE pending IS NOT NULL AND (pending->>'expiresAt')::timestamptz <= now()");
+    await this.db.query("DELETE FROM ai_metrics_hourly WHERE bucket < now() - interval '90 days'");
   }
 
   async stats(userId: number): Promise<{ turns: number; corrections: number; vocabulary: number }> {
@@ -247,6 +307,73 @@ export class Store {
       FROM turns WHERE user_id = $1 AND created_at > now() - $2 * interval '1 day'`, [userId, this.retentionDays]);
     const vocabulary = await this.db.query('SELECT count(*)::int AS total FROM vocabulary_items WHERE user_id = $1', [userId]);
     return { turns: Number(result.rows[0]?.turns ?? 0), corrections: Number(result.rows[0]?.corrections ?? 0), vocabulary: Number(vocabulary.rows[0]?.total ?? 0) };
+  }
+
+  async recordAiAttempt(event: AiAttempt): Promise<void> {
+    await this.db.query(`INSERT INTO ai_metrics_hourly(bucket, provider, feature, outcome, status_code, requests, duration_ms, input_tokens, output_tokens)
+      VALUES (date_trunc('hour', now()), $1, $2, $3, $4, 1, $5, $6, $7)
+      ON CONFLICT (bucket, provider, feature, outcome, status_code) DO UPDATE SET
+        requests = ai_metrics_hourly.requests + 1,
+        duration_ms = ai_metrics_hourly.duration_ms + EXCLUDED.duration_ms,
+        input_tokens = ai_metrics_hourly.input_tokens + EXCLUDED.input_tokens,
+        output_tokens = ai_metrics_hourly.output_tokens + EXCLUDED.output_tokens`,
+    [event.provider, event.feature, event.outcome, event.statusCode, event.durationMs, event.usage.inputTokens, event.usage.outputTokens]);
+  }
+
+  async providerDayUsage(provider: ProviderName): Promise<{ requests: number; inputTokens: number; outputTokens: number }> {
+    const result = await this.db.query(`SELECT coalesce(sum(requests), 0)::bigint AS requests,
+      coalesce(sum(input_tokens), 0)::bigint AS input_tokens,
+      coalesce(sum(output_tokens), 0)::bigint AS output_tokens
+      FROM ai_metrics_hourly
+      WHERE provider = $1 AND bucket >= date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'`, [provider]);
+    return {
+      requests: Number(result.rows[0]?.requests ?? 0),
+      inputTokens: Number(result.rows[0]?.input_tokens ?? 0),
+      outputTokens: Number(result.rows[0]?.output_tokens ?? 0),
+    };
+  }
+
+  async operationsStats(): Promise<OperationsStats> {
+    const [users, activity, vocabulary, providers] = await Promise.all([
+      this.db.query(`SELECT count(*)::int AS total,
+        count(*) FILTER (WHERE created_at >= now() - interval '24 hours')::int AS new_24h,
+        count(*) FILTER (WHERE created_at >= now() - interval '7 days')::int AS new_7d
+        FROM app_users`),
+      this.db.query(`SELECT
+        count(DISTINCT user_id) FILTER (WHERE created_at >= now() - interval '24 hours')::int AS active_24h,
+        count(DISTINCT user_id) FILTER (WHERE created_at >= now() - interval '7 days')::int AS active_7d,
+        count(DISTINCT user_id) FILTER (WHERE created_at >= now() - interval '30 days')::int AS active_30d,
+        count(*) FILTER (WHERE created_at >= now() - interval '24 hours')::int AS turns_24h,
+        count(*) FILTER (WHERE created_at >= now() - interval '7 days')::int AS turns_7d,
+        (SELECT count(*)::int FROM (SELECT user_id FROM turns WHERE created_at >= now() - interval '7 days' GROUP BY user_id HAVING count(*) >= 3) engaged_users) AS engaged_7d,
+        (SELECT count(*)::int FROM (SELECT user_id FROM turns WHERE created_at >= now() - interval '7 days' GROUP BY user_id HAVING count(DISTINCT (created_at AT TIME ZONE 'UTC')::date) >= 2) returning_users) AS returning_7d
+        FROM turns`),
+      this.db.query(`SELECT count(*)::int AS items, count(DISTINCT user_id)::int AS users FROM vocabulary_items`),
+      this.db.query(`SELECT provider,
+        coalesce(sum(requests), 0)::bigint AS attempts,
+        coalesce(sum(requests) FILTER (WHERE outcome = 'failure'), 0)::bigint AS failures,
+        CASE WHEN sum(requests) > 0 THEN round(sum(duration_ms)::numeric / sum(requests))::bigint ELSE 0 END AS average_ms,
+        coalesce(sum(input_tokens), 0)::bigint AS input_tokens,
+        coalesce(sum(output_tokens), 0)::bigint AS output_tokens
+        FROM ai_metrics_hourly WHERE bucket >= date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+        GROUP BY provider ORDER BY attempts DESC`),
+    ]);
+    const userRow = users.rows[0];
+    const activityRow = activity.rows[0];
+    const vocabularyRow = vocabulary.rows[0];
+    return {
+      users: { total: Number(userRow?.total ?? 0), new24h: Number(userRow?.new_24h ?? 0), new7d: Number(userRow?.new_7d ?? 0) },
+      activity: {
+        active24h: Number(activityRow?.active_24h ?? 0), active7d: Number(activityRow?.active_7d ?? 0), active30d: Number(activityRow?.active_30d ?? 0),
+        turns24h: Number(activityRow?.turns_24h ?? 0), turns7d: Number(activityRow?.turns_7d ?? 0),
+        engaged7d: Number(activityRow?.engaged_7d ?? 0), returning7d: Number(activityRow?.returning_7d ?? 0),
+      },
+      vocabulary: { users: Number(vocabularyRow?.users ?? 0), items: Number(vocabularyRow?.items ?? 0) },
+      providersToday: providers.rows.map(row => ({
+        provider: String(row.provider), attempts: Number(row.attempts), failures: Number(row.failures), averageMs: Number(row.average_ms),
+        inputTokens: Number(row.input_tokens), outputTokens: Number(row.output_tokens),
+      })),
+    };
   }
 }
 

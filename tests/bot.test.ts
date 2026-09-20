@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { PGlite } from '@electric-sql/pglite';
-import { commands, createBot } from '../src/bot.js';
+import { commands, CONSENT_VERSION, createBot } from '../src/bot.js';
 import { UserError } from '../src/domain.js';
 import type { Store } from '../src/storage.js';
+import { menuKeyboard } from '../src/ui/screens.js';
 import { answer, testConfig, testStore, vocabularyUsage } from './helpers.js';
 
 describe('Telegram conversation flow', () => {
@@ -11,7 +12,11 @@ describe('Telegram conversation flow', () => {
   beforeEach(async () => { ({ db, store } = await testStore()); });
   afterEach(async () => { await db.close(); });
 
-  async function setup(extra: NodeJS.ProcessEnv = {}) {
+  async function setup(extra: NodeJS.ProcessEnv = {}, readyUsers = [1]) {
+    for (const userId of readyUsers) {
+      await store.acceptConsent(userId, CONSENT_VERSION);
+      await store.completeOnboarding(userId, 'B1');
+    }
     const sent: string[] = [];
     const edited: string[] = [];
     const ai = {
@@ -49,6 +54,45 @@ describe('Telegram conversation flow', () => {
 
   it('publishes only the two entry commands', () => {
     expect(commands.map(command => command.command)).toEqual(['start', 'menu']);
+    expect(menuKeyboard().inline_keyboard.flat().map(button => button.text)).not.toContain('💬 К разговору');
+  });
+
+  it('keeps the user-facing privacy notice short and provider-neutral', async () => {
+    const h = await setup();
+    await h.send('/privacy');
+    expect(h.sent.at(-1)).toContain('Данные и приватность');
+    expect(h.sent.at(-1)).toContain('Продукт создан с помощью ИИ');
+    expect(h.sent.at(-1)?.toLowerCase()).not.toMatch(/groq|cloudflare|gemini|openrouter/);
+  });
+
+  it('stores nothing before consent and requires a starting level before chat', async () => {
+    const h = await setup({}, []);
+    await h.send('Привет');
+    expect(h.sent.at(-1)).toContain('Перед началом');
+    expect((await db.query('SELECT * FROM app_users')).rows).toEqual([]);
+    expect(h.ai.chat).not.toHaveBeenCalled();
+
+    await h.click('ui:consent:accept', 2);
+    expect(h.edited.at(-1)).toContain('С чего начнём');
+    expect(await store.hasConsent(1, CONSENT_VERSION)).toBe(true);
+    expect(await store.onboardingCompleted(1)).toBe(false);
+    await h.send('Ещё рано', 3);
+    expect(h.sent.at(-1)).toContain('С чего начнём');
+    expect(h.ai.chat).not.toHaveBeenCalled();
+
+    await h.click('ui:onboard:A0', 4);
+    expect((await store.settings(1)).level).toBe('A0');
+    expect(await store.onboardingCompleted(1)).toBe(true);
+    expect(h.edited.at(-1)).toContain('начнём с нуля');
+    await h.send('Я не знаю английский', 5);
+    expect(h.ai.chat).toHaveBeenCalledWith(expect.objectContaining({ settings: expect.objectContaining({ level: 'A0' }) }));
+  });
+
+  it('does not create a user when consent is declined', async () => {
+    const h = await setup({}, []);
+    await h.click('ui:consent:decline', 1);
+    expect(h.edited.at(-1)).toContain('Без согласия');
+    expect((await db.query('SELECT * FROM app_users')).rows).toEqual([]);
   });
 
   it('answers, explains mistakes, remembers the next turn, and ignores duplicate updates', async () => {
@@ -151,7 +195,7 @@ describe('Telegram conversation flow', () => {
   });
 
   it('allows private users by default, ignores groups, and supports an optional allowlist', async () => {
-    const h = await setup();
+    const h = await setup({}, [1, 99]);
     await h.send('hello', 1, 99);
     expect(h.ai.chat).toHaveBeenCalledTimes(1);
     await h.send('group text', 2, 99, 'group');
@@ -161,5 +205,15 @@ describe('Telegram conversation flow', () => {
     expect(privateBot.sent[0]).toContain('99');
     await privateBot.send('hello', 4, 99);
     expect(privateBot.ai.chat).not.toHaveBeenCalled();
+  });
+
+  it('keeps aggregate operations statistics behind the hidden admin command', async () => {
+    const h = await setup({ ADMIN_TELEGRAM_IDS: '1' });
+    await h.send('hello', 1, 2);
+    await h.send('/admin', 2, 1);
+    expect(h.sent.at(-1)).toContain('Состояние бота');
+    expect(h.sent.at(-1)).toContain('Активные:');
+    await h.send('/admin', 3, 2);
+    expect(h.sent.at(-1)).toBe('Команда недоступна.');
   });
 });

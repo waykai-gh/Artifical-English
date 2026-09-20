@@ -6,18 +6,48 @@ export type Screen = { text: string; keyboard: InlineKeyboard };
 export type SettingsSection = 'level' | 'corrections' | 'language' | 'voice';
 export const escapeHtml = (text: string) => text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 const short = (text: string, length = 45) => Array.from(text).length > length ? `${Array.from(text).slice(0, length - 1).join('')}…` : text;
-export const menuKeyboard = () => new InlineKeyboard().text('💬 К разговору', 'ui:chat').row()
+export const menuKeyboard = () => new InlineKeyboard()
   .text('📚 Мой словарь', 'ui:words:1').text('⚙️ Настройки', 'ui:settings').row()
-  .text('Как здесь учиться', 'ui:guide');
+  .text('ℹ️ Информация', 'ui:guide');
 export const backToMenu = () => new InlineKeyboard().text('‹ Меню', 'ui:menu');
 export const levelLabels: Record<Settings['level'], string> = {
-  A1: 'A1 · Первые шаги', A2: 'A2 · Простые разговоры', B1: 'B1 · Повседневные темы',
+  A0: 'A0 · Начинаю с нуля', A1: 'A1 · Первые шаги', A2: 'A2 · Простые разговоры', B1: 'B1 · Повседневные темы',
   B2: 'B2 · Свободнее и подробнее', C1: 'C1 · Сложные темы', C2: 'C2 · Тонкости языка',
 };
 export const correctionLabels: Record<Settings['corrections'], string> = { detailed: 'Подробно', gentle: 'Коротко', off: 'Без исправлений' };
 export const voiceLabels: Record<Settings['voiceMode'], string> = { auto: 'На голосовые', on: 'Всегда', off: 'Только текст' };
 
-export function welcomeScreen(returning: boolean): Screen {
+export function consentScreen(): Screen {
+  return {
+    text: '<b>Перед началом</b>\n\nEllie — AI-тренажёр английского. Продукт создан с помощью ИИ, а ответы могут содержать ошибки.\n\nДля работы бот сохраняет Telegram ID, настройки, тексты/расшифровки, ответы и словарь. Сообщения передаются AI-сервису для подготовки ответа; Telegram ID туда не передаётся.\n\nНажимая «Согласен», ты разрешаешь такую обработку. Согласие можно отозвать командой /forget.',
+    keyboard: new InlineKeyboard().text('Согласен, продолжить', 'ui:consent:accept').row()
+      .text('Подробнее о данных', 'ui:privacy:consent').row().text('Не согласен', 'ui:consent:decline'),
+  };
+}
+
+export function consentDeclinedScreen(): Screen {
+  return {
+    text: 'Хорошо. Без согласия бот не сохраняет твои данные и не может начать обучение.\n\nЕсли передумаешь, открой /start.',
+    keyboard: new InlineKeyboard().text('Вернуться', 'ui:consent:show'),
+  };
+}
+
+export function levelOnboardingScreen(): Screen {
+  const keyboard = new InlineKeyboard();
+  for (const [value, label] of Object.entries(levelLabels)) keyboard.text(label, `ui:onboard:${value}`).row();
+  return {
+    text: '<b>С чего начнём?</b>\n\nВыбери примерный уровень. Если не знаешь алфавит или самые базовые фразы — выбирай A0. Потом уровень можно изменить в настройках.',
+    keyboard,
+  };
+}
+
+export function welcomeScreen(returning: boolean, level: Settings['level'] = 'B1'): Screen {
+  if (level === 'A0') return {
+    text: returning
+      ? 'С возвращением! Можно писать по-русски — будем добавлять английский постепенно.\n\n<b>Hello</b> — привет («хэлоу»).'
+      : 'Отлично, начнём с нуля. Можно писать только по-русски: я не буду требовать, чтобы ты сразу говорил на английском.\n\nПервая фраза: <b>Hello</b> — привет («хэлоу»).',
+    keyboard: new InlineKeyboard().text('Начать с азов', 'ui:topic:basics').text('Меню', 'ui:menu'),
+  };
   return {
     text: returning
       ? 'Рада снова тебя видеть! Просто напиши — продолжим практиковать английский.\n\n<b>How has your day been?</b>'
@@ -33,12 +63,18 @@ export function mainMenuScreen(stats: { turns: number; vocabulary: number }): Sc
   };
 }
 
-export function topicsScreen(): Screen {
+export function topicsScreen(level: Settings['level'] = 'B1'): Screen {
+  if (level === 'A0') return {
+    text: '<b>Первые шаги</b>\n\nВыбери тему. Отвечать можно по-русски.',
+    keyboard: new InlineKeyboard().text('🔤 Алфавит и звуки', 'ui:topic:alphabet').row()
+      .text('👋 Приветствие', 'ui:topic:basics').row()
+      .text('👤 Как рассказать о себе', 'ui:topic:intro').row().text('‹ Назад', 'ui:chat'),
+  };
   return {
     text: '<b>Начнём с чего-то знакомого</b>\n\nВыбери тему, и я задам простой вопрос. Можно и просто написать свою мысль.',
     keyboard: new InlineKeyboard().text('☀️ Мой день', 'ui:topic:day').row()
       .text('☕ Еда и привычки', 'ui:topic:food').row()
-      .text('✈️ Путешествия', 'ui:topic:travel').row().text('‹ К разговору', 'ui:chat'),
+      .text('✈️ Путешествия', 'ui:topic:travel').row().text('‹ Назад', 'ui:chat'),
   };
 }
 
@@ -61,7 +97,9 @@ export function settingsChoiceScreen(section: SettingsSection, settings: Setting
     text = '<b>Как разбирать ошибки?</b>\n\nПодробно — исправления с объяснениями.\nКоротко — только самые важные моменты.\nБез исправлений — просто разговор.';
     for (const [value, label] of Object.entries(correctionLabels)) keyboard.text(`${settings.corrections === value ? '✓ ' : ''}${label}`, `ui:set:corrections:${value}`).row();
   } else if (section === 'language') {
-    text = '<b>На каком языке объяснять?</b>\n\nСам разговор остаётся на английском. Этот выбор меняет язык разбора ошибок и примеров из словаря.';
+    text = '<b>На каком языке объяснять?</b>\n\n'
+      + (settings.level === 'A0' ? 'На A0 основной разговор идёт по-русски.' : 'Сам разговор остаётся на английском.')
+      + ' Этот выбор меняет язык разбора ошибок и примеров из словаря.';
     keyboard.text(`${settings.explanationLanguage === 'ru' ? '✓ ' : ''}По-русски`, 'ui:set:language:ru').row()
       .text(`${settings.explanationLanguage === 'en' ? '✓ ' : ''}По-английски`, 'ui:set:language:en').row();
   } else {
@@ -97,16 +135,16 @@ export function vocabularyScreen(item: VocabularyItem, page = 1, saved = false):
     text: `${saved ? '✓ Сохранено\n\n' : ''}<b>${escapeHtml(item.term)}</b>\n${escapeHtml(item.translation)}\n\nПосмотрим, как это звучит в живом английском?`,
     keyboard: new InlineKeyboard().text('💬 Примеры и употребление', `ui:explain:${item.id}:${page}`).row()
       .text('Изменить перевод', `ui:edit:${item.id}:${page}`).text('Удалить', `ui:delete:${item.id}:${page}`).row()
-      .text('‹ Мой словарь', `ui:words:${page}`).text('К разговору', 'ui:chat'),
+      .text('‹ Мой словарь', `ui:words:${page}`).text('Меню', 'ui:menu'),
   };
 }
 
 export function guideScreen(canTranscribe: boolean): Screen {
   return {
-    text: '<b>Немного практики каждый день</b>\n\nНачни с того, что уже хочется сказать: расскажи о своём дне, задай бытовой вопрос или обсуди планы. Я отвечу и помогу улучшить английский.'
+    text: '<b>Как здесь учиться</b>\n\nПросто напиши в чат или выбери тему. Я отвечу, помогу с формулировкой и разберу ошибки. Для самого начального уровня есть A0.'
       + (canTranscribe ? '\n\n🎧 Можно прислать голосовое. Покажу, что расслышала, и отвечу.' : '')
-      + '\n\n📚 Полезные слова и выражения можно собирать в своём словаре.\n\n⚙️ Сложность и количество исправлений меняются в настройках. Здесь нет обязательной программы — учимся через разговор.',
-    keyboard: new InlineKeyboard().text('Выбрать тему', 'ui:topics').row().text('Как хранятся данные', 'ui:privacy').row().text('‹ Меню', 'ui:menu'),
+      + '\n\n📚 Слова можно сохранять в словарь. Сложность и количество исправлений меняются в настройках.\n\nПродукт создан с помощью ИИ; ответы могут содержать ошибки.',
+    keyboard: new InlineKeyboard().text('Выбрать тему', 'ui:topics').row().text('Данные и приватность', 'ui:privacy:guide').row().text('‹ Меню', 'ui:menu'),
   };
 }
 

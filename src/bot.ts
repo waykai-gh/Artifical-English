@@ -11,28 +11,60 @@ import type { SpeechService } from './speech.js';
 import { createPending, type PendingAction } from './ui-state.js';
 import { repairPrivateChatMenu, publicCommands } from './telegram-setup.js';
 import type { BotDependencies } from './dependencies.js';
-import { dataScreen, dictionaryScreen, guideScreen, mainMenuScreen, menuKeyboard, settingsChoiceScreen, settingsScreen, topicsScreen, vocabularyScreen, welcomeScreen, confirmScreen, type SettingsSection } from './ui/screens.js';
+import type { OperationsStats } from './storage.js';
+import { consentDeclinedScreen, consentScreen, dataScreen, dictionaryScreen, guideScreen, levelOnboardingScreen, mainMenuScreen, menuKeyboard, settingsChoiceScreen, settingsScreen, topicsScreen, vocabularyScreen, welcomeScreen, confirmScreen, type SettingsSection } from './ui/screens.js';
 import { showScreen } from './ui/messages.js';
 
 export const commands = publicCommands;
+export const CONSENT_VERSION = '2026-09-20';
+
+export function operationsText(stats: OperationsStats, c: Config): string {
+  const providerLines = stats.providersToday.length
+    ? stats.providersToday.map(provider => {
+      const success = provider.attempts ? Math.round((provider.attempts - provider.failures) / provider.attempts * 100) : 0;
+      const tokens = provider.inputTokens + provider.outputTokens;
+      const cloudflareUnits = provider.provider === 'cloudflare' && tokens
+        ? Math.ceil(provider.inputTokens * c.CLOUDFLARE_INPUT_NEURONS_PER_MILLION / 1_000_000 + provider.outputTokens * c.CLOUDFLARE_OUTPUT_NEURONS_PER_MILLION / 1_000_000)
+        : 0;
+      const budgetPercent = provider.provider === 'groq' && c.GROQ_DAILY_TOKEN_BUDGET > 0
+        ? Math.floor(tokens / c.GROQ_DAILY_TOKEN_BUDGET * 100)
+        : provider.provider === 'cloudflare' && c.CLOUDFLARE_DAILY_NEURON_BUDGET > 0
+          ? Math.floor(cloudflareUnits / c.CLOUDFLARE_DAILY_NEURON_BUDGET * 100)
+          : provider.provider === 'openrouter' && c.OPENROUTER_DAILY_REQUEST_BUDGET > 0
+            ? Math.floor(provider.attempts / c.OPENROUTER_DAILY_REQUEST_BUDGET * 100) : 0;
+      return `• ${provider.provider}: ${provider.attempts} запросов · ${success}% успешно · ${provider.averageMs} мс${tokens ? ` · ${tokens.toLocaleString('ru-RU')} токенов` : ''}${cloudflareUnits ? ` · ~${cloudflareUnits.toLocaleString('ru-RU')} нейронов` : ''}${budgetPercent ? ` · ${budgetPercent}% бюджета` : ''}`;
+    }).join('\n')
+    : '• Сегодня запросов ещё нет';
+  const alerts = c.ALERTS_ENABLED === 'true' && c.ADMIN_TELEGRAM_IDS.trim() ? 'включены' : 'выключены';
+  return `📊 Состояние бота\n\nПользователи\nВсего: ${stats.users.total}\nНовые: ${stats.users.new24h} за 24 ч · ${stats.users.new7d} за 7 дней\nАктивные: ${stats.activity.active24h} / ${stats.activity.active7d} / ${stats.activity.active30d} за 1 / 7 / 30 дней\nВовлечённые (3+ реплики за 7 дней): ${stats.activity.engaged7d}\nВернулись минимум в 2 разных дня: ${stats.activity.returning7d}\n\nИспользование\nУспешных реплик: ${stats.activity.turns24h} за 24 ч · ${stats.activity.turns7d} за 7 дней\nСловарь: ${stats.vocabulary.items} записей у ${stats.vocabulary.users} пользователей\n\nAI сегодня (UTC)\n${providerLines}\n\nКонтекст\nДо ${c.HISTORY_TURNS} последних пар · максимум ${c.HISTORY_MAX_CHARS.toLocaleString('ru-RU')} символов · хранение ${c.RETENTION_DAYS} дней\n\nАлерты: ${alerts}`;
+}
 
 export function settingsText(s: Settings) {
   return `Уровень: ${s.level}\nРазбор ошибок: ${s.corrections}\nЯзык объяснений: ${s.explanationLanguage}\nОзвучка: ${s.voiceMode}`;
 }
 
 function privacyText(c: Config): string {
-  return `Бот хранит Telegram ID, настройки, тексты/расшифровки и ответы в PostgreSQL. Срок хранения разговоров: ${c.RETENTION_DAYS} дней. В запрос ИИ передаются последние ${c.HISTORY_TURNS} пар сообщений и текущее сообщение; Telegram ID не передаётся.
-Текст обрабатывают настроенные ИИ-сервисы (${c.AI_PROVIDER_ORDER.join(', ')}). При сбое одного история может уйти следующему. Аудио отправляется Groq или Gemini для расшифровки, английский ответ — Groq для озвучки; резервная озвучка работает локально. Аудио не сохраняется в базе, временные файлы озвучки удаляются после обработки.
-Словарь хранит введённые тобой английские слова и переводы без срока автоматического удаления. По команде /word выбранная запись передаётся ИИ для объяснения употребления.
-Сервисы и Telegram обрабатывают данные по своим правилам, а некоторые бесплатные тарифы используют запросы для улучшения моделей. /forget удаляет данные из базы бота; копии Telegram, резервные копии и данные провайдеров эта команда не удаляет.`;
+  return `<b>Данные и приватность</b>
+
+• Telegram ID и настройки.
+• Тексты, расшифровки голоса и ответы — ${c.RETENTION_DAYS} дней.
+• Словарь — пока ты не удалишь записи или все данные.
+
+Тексты и расшифровки передаются AI-сервису для ответа; Telegram ID туда не передаётся. В контекст попадают до ${c.HISTORY_TURNS} последних пар сообщений. Аудиофайлы в базе не хранятся.
+
+/forget удаляет данные из базы бота, но не копии Telegram, резервные копии или уже обработанные данные внешних сервисов.
+
+Продукт создан с помощью ИИ; ответы могут содержать ошибки.`;
 }
 
 export type { BotDependencies } from './dependencies.js';
 
 export function createBot(c: Config, deps: BotDependencies): Bot {
-  const { store, ai, speech, logger } = deps;
+  const { store, ai, speech, logger, operations } = deps;
   const bot = new Bot(c.BOT_TOKEN);
   const allowed = new Set(c.ALLOWED_USER_IDS.split(',').map(s => s.trim()).filter(Boolean));
+  const admins = new Set(c.ADMIN_TELEGRAM_IDS.split(',').map(s => s.trim()).filter(Boolean));
+  for (const id of admins) allowed.add(id);
 
   bot.use(async (ctx, next) => {
     if (ctx.chat?.type !== 'private' || !ctx.from || ctx.from.is_bot) return;
@@ -50,17 +82,45 @@ export function createBot(c: Config, deps: BotDependencies): Bot {
   bot.use(async (ctx, next) => {
     try { await next(); } catch (error) {
       logger.error({ kind: error instanceof UserError ? 'user_error' : 'update_error', telegramCode: error instanceof GrammyError ? error.error_code : undefined }, 'Update could not be completed');
+      if (!(error instanceof UserError)) await operations?.noteUpdateError();
       await ctx.reply(error instanceof UserError ? error.message : 'Не удалось завершить запрос. Попробуй ещё раз через минуту.').catch(() => undefined);
     }
   });
 
+  bot.command('admin', async ctx => {
+    if (!admins.has(String(ctx.from!.id))) { await ctx.reply('Команда недоступна.'); return; }
+    await ctx.reply(operationsText(await store.operationsStats(), c));
+  });
+
+  bot.use(async (ctx, next) => {
+    const userId = ctx.from!.id;
+    const command = ctx.message?.text?.split(/\s/, 1)[0]?.toLowerCase();
+    const callback = ctx.callbackQuery?.data ?? '';
+    const publicBeforeConsent = command === '/start' || command === '/privacy' || command === '/forget'
+      || callback.startsWith('ui:consent:') || callback.startsWith('ui:privacy:');
+    if (publicBeforeConsent) { await next(); return; }
+    if (!await store.hasConsent(userId, CONSENT_VERSION)) {
+      if (ctx.callbackQuery) await ctx.answerCallbackQuery().catch(() => undefined);
+      await showScreen(ctx, consentScreen());
+      return;
+    }
+    if (!await store.onboardingCompleted(userId) && !callback.startsWith('ui:onboard:')) {
+      if (ctx.callbackQuery) await ctx.answerCallbackQuery().catch(() => undefined);
+      await showScreen(ctx, levelOnboardingScreen());
+      return;
+    }
+    await next();
+  });
+
   bot.command('start', async ctx => {
     const userId = ctx.from!.id;
-    await store.settings(userId);
+    if (!await store.hasConsent(userId, CONSENT_VERSION)) { await showScreen(ctx, consentScreen()); return; }
+    if (!await store.onboardingCompleted(userId)) { await showScreen(ctx, levelOnboardingScreen()); return; }
     await store.setPending(userId, null);
     void repairPrivateChatMenu(bot.api, userId, ctx.from?.language_code).catch(() => undefined);
     const ui = await store.getUiState(userId);
-    await showScreen(ctx, welcomeScreen(ui.conversationCount > 0));
+    const settings = await store.settings(userId);
+    await showScreen(ctx, welcomeScreen(ui.conversationCount > 0, settings.level));
   });
   bot.command('menu', async ctx => {
     await store.setPending(ctx.from!.id, null);
@@ -72,7 +132,7 @@ export function createBot(c: Config, deps: BotDependencies): Bot {
   bot.command('settings', async ctx => { await showScreen(ctx, settingsScreen(await store.settings(ctx.from!.id))); });
   bot.command('level', async ctx => {
     const value = levelSchema.safeParse(ctx.match.trim().toUpperCase());
-    if (!value.success) { await ctx.reply('Выбери уровень: /level A1, A2, B1, B2, C1 или C2.'); return; }
+    if (!value.success) { await ctx.reply('Выбери уровень: /level A0, A1, A2, B1, B2, C1 или C2.'); return; }
     await ctx.reply(settingsText(await store.updateSettings(ctx.from!.id, { level: value.data })));
   });
   bot.command('corrections', async ctx => {
@@ -135,16 +195,20 @@ export function createBot(c: Config, deps: BotDependencies): Bot {
       ? `Запись #${id} удалена из словаря.`
       : 'Запись не найдена. Посмотреть словарь: /words');
   });
-  bot.command('reset', async ctx => { await store.clear(ctx.from!.id); await ctx.reply('История разговора очищена. Настройки сохранены. What would you like to talk about?'); });
-  bot.command('forget', async ctx => { await store.forget(ctx.from!.id); await ctx.reply('История, словарь и настройки удалены из базы бота. Следующее сообщение начнёт новый разговор.'); });
+  bot.command('reset', async ctx => {
+    await store.clear(ctx.from!.id);
+    const settings = await store.settings(ctx.from!.id);
+    await showScreen(ctx, welcomeScreen(true, settings.level));
+  });
+  bot.command('forget', async ctx => { await store.forget(ctx.from!.id); await showScreen(ctx, consentScreen()); });
   bot.command('stats', async ctx => {
     const stats = await store.stats(ctx.from!.id);
     await ctx.reply(`За последние ${c.RETENTION_DAYS} дней с момента очистки:\nСообщений в практике: ${stats.turns}\nРазобрано ошибок: ${stats.corrections}\nСлов и выражений в словаре: ${stats.vocabulary}`);
   });
-  bot.command('privacy', ctx => ctx.reply(`Бот хранит Telegram ID, настройки, тексты/расшифровки и ответы в PostgreSQL. Срок хранения разговоров: ${c.RETENTION_DAYS} дней. В запрос ИИ передаются последние ${c.HISTORY_TURNS} пар сообщений и текущее сообщение; Telegram ID не передаётся.
-Текст обрабатывают настроенные ИИ-сервисы (${c.AI_PROVIDER_ORDER.join(', ')}). При сбое одного история может уйти следующему. Аудио отправляется Groq или Gemini для расшифровки, английский ответ — Groq для озвучки; резервная озвучка работает локально. Аудио не сохраняется в базе, временные файлы озвучки удаляются после обработки.
-Словарь хранит введённые тобой английские слова и переводы без срока автоматического удаления. По команде /word выбранная запись передаётся ИИ для объяснения употребления.
-Сервисы и Telegram обрабатывают данные по своим правилам, а некоторые бесплатные тарифы используют запросы для улучшения моделей. /forget удаляет данные из базы бота; копии Telegram, резервные копии и данные провайдеров эта команда не удаляет.`));
+  bot.command('privacy', async ctx => {
+    const hasConsent = await store.hasConsent(ctx.from!.id, CONSENT_VERSION);
+    await showScreen(ctx, { text: privacyText(c), keyboard: new InlineKeyboard().text('‹ Назад', hasConsent ? 'ui:guide' : 'ui:consent:show') });
+  });
 
   bot.on('callback_query:data', async ctx => {
     const data = ctx.callbackQuery.data;
@@ -154,6 +218,27 @@ export function createBot(c: Config, deps: BotDependencies): Bot {
     if (scope !== 'ui') return;
     const clearPending = async () => { await store.setPending(userId, null); };
 
+    if (action === 'consent') {
+      if (arg === 'accept') {
+        await store.acceptConsent(userId, CONSENT_VERSION);
+        await showScreen(ctx, levelOnboardingScreen());
+      } else if (arg === 'decline') {
+        await store.forget(userId);
+        await showScreen(ctx, consentDeclinedScreen());
+      } else {
+        await showScreen(ctx, consentScreen());
+      }
+      return;
+    }
+    if (action === 'onboard') {
+      const parsed = levelSchema.safeParse(arg);
+      if (!parsed.success || !await store.hasConsent(userId, CONSENT_VERSION)) { await showScreen(ctx, consentScreen()); return; }
+      const settings = await store.completeOnboarding(userId, parsed.data);
+      void repairPrivateChatMenu(bot.api, userId, ctx.from?.language_code).catch(() => undefined);
+      await showScreen(ctx, welcomeScreen(false, settings.level));
+      return;
+    }
+
     if (action === 'menu') {
       await clearPending();
       await showScreen(ctx, mainMenuScreen(await store.stats(userId)));
@@ -162,20 +247,30 @@ export function createBot(c: Config, deps: BotDependencies): Bot {
     if (action === 'chat') {
       await clearPending();
       const state = await store.getUiState(userId);
-      await showScreen(ctx, welcomeScreen(state.conversationCount > 0));
+      const settings = await store.settings(userId);
+      await showScreen(ctx, welcomeScreen(state.conversationCount > 0, settings.level));
       return;
     }
     if (action === 'guide') { await clearPending(); await showScreen(ctx, guideScreen(speech.canTranscribe)); return; }
-    if (action === 'topics') { await clearPending(); await showScreen(ctx, topicsScreen()); return; }
+    if (action === 'topics') {
+      await clearPending();
+      await showScreen(ctx, topicsScreen((await store.settings(userId)).level));
+      return;
+    }
     if (action === 'topic') {
-      const questions: Record<string, string> = {
+      const level = (await store.settings(userId)).level;
+      const questions: Record<string, string> = level === 'A0' ? {
+        alphabet: 'Начнём с алфавита и звуков. Напиши, знаешь ли ты хоть несколько английских букв.',
+        basics: '<b>Hello</b> — «привет» («хэлоу»). Напиши «готов», и мы разберём первое приветствие.',
+        intro: 'Будем учиться представляться. Напиши своё имя по-русски.',
+      } : {
         day: 'What did you do today? Tell me about one good or difficult moment.',
         food: 'What do you usually eat or drink when you want to feel good?',
         travel: 'Where would you like to travel, and what would you do there?',
       };
       const question = questions[arg ?? ''];
       if (!question) return;
-      await ctx.editMessageText(`Great, let’s talk about it.\n\n<b>${question}</b>`, { parse_mode: 'HTML', reply_markup: menuKeyboard() });
+      await ctx.editMessageText(level === 'A0' ? question : `Great, let’s talk about it.\n\n<b>${question}</b>`, { parse_mode: 'HTML', reply_markup: menuKeyboard() });
       return;
     }
     if (action === 'settings') {
@@ -210,7 +305,7 @@ export function createBot(c: Config, deps: BotDependencies): Bot {
     }
     if (action === 'data') { await clearPending(); await showScreen(ctx, dataScreen()); return; }
     if (action === 'privacy') {
-      await showScreen(ctx, { text: privacyText(c), keyboard: new InlineKeyboard().text('‹ Назад', 'ui:guide') });
+      await showScreen(ctx, { text: privacyText(c), keyboard: new InlineKeyboard().text('‹ Назад', arg === 'consent' ? 'ui:consent:show' : 'ui:guide') });
       return;
     }
     if (action === 'words') {
@@ -293,10 +388,10 @@ export function createBot(c: Config, deps: BotDependencies): Bot {
       }
       if (pending.action === 'reset') {
         await store.clear(userId);
-        await showScreen(ctx, welcomeScreen(true));
+        await showScreen(ctx, welcomeScreen(true, (await store.settings(userId)).level));
       } else if (pending.action === 'forget') {
         await store.forget(userId);
-        await showScreen(ctx, welcomeScreen(false));
+        await showScreen(ctx, consentScreen());
       } else if (pending.itemId) {
         await store.deleteVocabulary(userId, pending.itemId);
         await showScreen(ctx, dictionaryScreen(await store.listVocabulary(userId, 1)));

@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-export const levelSchema = z.enum(['A1', 'A2', 'B1', 'B2', 'C1', 'C2']);
+export const levelSchema = z.enum(['A0', 'A1', 'A2', 'B1', 'B2', 'C1', 'C2']);
 export const languageSchema = z.enum(['ru', 'en']);
 export const correctionsSchema = z.enum(['gentle', 'detailed', 'off']);
 export const voiceSchema = z.enum(['auto', 'on', 'off']);
@@ -38,6 +38,16 @@ export type VocabularyInput = { settings: Settings; term: string; translation: s
 export type Message = { role: 'user' | 'assistant'; content: string };
 export type ChatInput = { settings: Settings; history: Message[]; text: string; fromVoice: boolean };
 export type ProviderName = 'groq' | 'cloudflare' | 'gemini' | 'openrouter';
+export type AiFeature = 'chat' | 'vocabulary';
+export type TokenUsage = { inputTokens: number; outputTokens: number };
+export type AiAttempt = {
+  provider: ProviderName;
+  feature: AiFeature;
+  outcome: 'success' | 'failure';
+  statusCode: number;
+  durationMs: number;
+  usage: TokenUsage;
+};
 
 export class UserError extends Error {}
 
@@ -57,7 +67,9 @@ function parseJson(raw: string): unknown {
 export function buildPrompt(settings: Settings, fromVoice: boolean): string {
   return `You are Ellie, a warm English conversation partner and tutor for a Russian-speaking learner.
 Have a real conversation: answer everyday questions helpfully, discuss interests, and ask at most one natural follow-up question.
-Your conversational reply is in English, appropriate to CEFR ${settings.level}. If the learner uses Russian, help them express the thought in English without calling Russian a mistake.
+${settings.level === 'A0'
+    ? 'The learner is a complete beginner who may not know the English alphabet or basic words. Reply primarily in Russian. Introduce at most one very short English phrase at a time, always with a Russian translation and a simple pronunciation hint in Cyrillic. Never require an English-only answer and never treat Russian as a mistake.'
+    : `Your conversational reply is in English, appropriate to CEFR ${settings.level}. If the learner uses Russian, help them express the thought in English without calling Russian a mistake.`}
 Keep your reply under 900 characters, usually 2-5 short sentences. No markdown formatting.
 Answer honestly. Do not invent live facts, personal experiences or access to tools, websites, or the user's microphone.
 Correction mode: ${settings.corrections}. Explanation language: ${settings.explanationLanguage === 'ru' ? 'Russian' : 'English'}.
