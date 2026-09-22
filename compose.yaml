@@ -6,18 +6,20 @@ x-logging: &default-logging
 
 services:
   db:
-    image: postgres:17-alpine
+    image: postgres:17-alpine@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
     mem_limit: 512m
     cpus: "0.75"
     logging: *default-logging
     environment:
       POSTGRES_USER: english
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-english_local_only}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
       POSTGRES_DB: english
     ports:
       - "127.0.0.1:${POSTGRES_PORT:-15432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    secrets:
+      - postgres_password
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U english -d english"]
       interval: 5s
@@ -29,9 +31,25 @@ services:
     mem_limit: 768m
     cpus: "1.0"
     logging: *default-logging
-    env_file: .env
-    environment:
-      DATABASE_URL: postgresql://english:${POSTGRES_PASSWORD:-english_local_only}@db:5432/english
+    # Generated from an allowlist. Raw preserves literal dollar signs in keys.
+    env_file:
+      - path: ./deploy/runtime.env
+        format: raw
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    pids_limit: 128
+    tmpfs:
+      - /tmp:size=192m,mode=1777,noexec,nosuid
+    volumes:
+      - ./deploy/backup-status:/run/backup-status:ro
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8081/live',{signal:AbortSignal.timeout(6000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 90s
     depends_on:
       db:
         condition: service_healthy
@@ -40,3 +58,6 @@ services:
     restart: unless-stopped
 volumes:
   postgres_data:
+secrets:
+  postgres_password:
+    file: ./deploy/postgres_password

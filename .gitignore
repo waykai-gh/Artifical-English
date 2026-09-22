@@ -6,3 +6,9 @@ dist/
 coverage/
 *.log
 .tmp/
+deploy/runtime.env
+deploy/postgres_password
+deploy/security_key
+backups/
+deploy/backup_key
+deploy/backup-status/

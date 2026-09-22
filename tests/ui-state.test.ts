@@ -16,7 +16,7 @@ describe('Persistent interaction state', () => {
     await store.setPending(1, pending);
     await store.markTipSeen(1, 'vocabulary');
     await store.noteConversation(1);
-    const restored = new Store({ query: async (sql, params) => ({ rows: (await db.query<Record<string, unknown>>(sql, params)).rows }) }, await store.settings(1), 8, 30);
+    const restored = new Store({ query: async (sql, params) => ({ rows: (await db.query<Record<string, unknown>>(sql, params)).rows }) }, await store.settings(1), 8, 30, 6000, 'test-only-do-not-use-in-production');
     expect(await restored.getUiState(1)).toEqual({ pending, tipFlags: ['vocabulary'], conversationCount: 1 });
     expect(await restored.getUiState(2)).toEqual({ pending: null, tipFlags: [], conversationCount: 0 });
   });

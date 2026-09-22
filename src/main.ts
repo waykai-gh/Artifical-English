@@ -10,6 +10,8 @@ import { createLogger } from './log.js';
 import { configureTelegramMenu } from './telegram-setup.js';
 import { acquirePollingLock, RuntimeError, runtimeFailure, startRuntimeControl } from './runtime-health.js';
 import { OperationsMonitor, startHeartbeat } from './operations.js';
+import { RuntimeHealth, startHealthServer } from './health.js';
+import { backupHealthy } from './backup-health.js';
 
 let stage = 'configuration';
 let operations: OperationsMonitor | undefined;
@@ -24,7 +26,8 @@ async function main() {
   try {
     stage = 'database migration';
     await migrate(pool);
-    const store = new Store(pool, defaults(c), c.HISTORY_TURNS, c.RETENTION_DAYS, c.HISTORY_MAX_CHARS);
+    const store = new Store(pool, defaults(c), c.HISTORY_TURNS, c.RETENTION_DAYS, c.HISTORY_MAX_CHARS, c.SECURITY_HMAC_KEY);
+    await store.migrateLegacyLimits();
     const alertApi = new Api(c.BOT_TOKEN);
     operations = new OperationsMonitor(store, (chatId, text) => alertApi.sendMessage(chatId, text), logger, {
       enabled: c.ALERTS_ENABLED === 'true',
@@ -45,7 +48,7 @@ async function main() {
     });
     await store.cleanup();
     const providers = createProviders(c);
-    const bot = createBot(c, { store, ai: new AiRouter(providers, logger, Date.now, operations), speech: new Speech(c), logger, operations });
+    const bot = createBot(c, { store, ai: new AiRouter(providers, logger, Date.now, operations), speech: new Speech(c, fetch, operations), logger, operations });
     stage = 'Telegram initialization';
     await bot.init();
     // Never silently replace another deployment's webhook or discard queued messages.
@@ -62,15 +65,32 @@ async function main() {
     await configureTelegramMenu(bot.api, users.rows.map(user => Number(user.id)));
     if (lockLost) throw new RuntimeError('PostgreSQL polling lock was lost during startup.');
     stage = 'polling';
+    let isRunning = () => false;
+    const health = new RuntimeHealth(() => pool.query('SELECT 1'), () => !lockLost && isRunning(), () => operations?.servicesHealthy() ?? false);
+    bot.api.config.use(async (prev, method, payload, signal) => {
+      const result = await prev(method, payload, signal);
+      if (method === 'getUpdates' && result.ok) health.pollSucceeded();
+      return result;
+    });
+    const originalHandleUpdate = bot.handleUpdate.bind(bot);
+    bot.handleUpdate = async (...args) => { try { await originalHandleUpdate(...args); } finally { health.updateCompleted(); } };
     const runner = run(bot, {
       runner: { fetch: { allowed_updates: ['message', 'callback_query'] }, silent: true },
-      sink: { concurrency: 8 },
+      sink: { concurrency: c.UPDATE_CONCURRENCY },
     });
-    const cleanupTimer = setInterval(() => { void store.cleanup().catch(() => {
+    isRunning = runner.isRunning;
+    const cleanupTimer = setInterval(() => { void store.cleanup().then(() => operations?.noteMaintenanceSuccess('очистка истории')).catch(() => {
       logger.error('Retention cleanup failed');
       void operations?.noteMaintenanceError('очистка истории');
     }); }, 60 * 60 * 1000);
     cleanupTimer.unref();
+    const checkBackup = async () => {
+      if (await backupHealthy(c.BACKUP_STATUS_DIR)) await operations?.noteMaintenanceSuccess('резервная копия и проверка восстановления');
+      else await operations?.noteMaintenanceError('резервная копия и проверка восстановления');
+    };
+    await checkBackup();
+    const backupTimer = setInterval(() => { void checkBackup(); }, 5 * 60_000);
+    backupTimer.unref();
     let stopping: Promise<void> | undefined;
     const stop = () => {
       if (stopping) return;
@@ -83,22 +103,26 @@ async function main() {
     process.once('SIGTERM', stop);
     let closeControl: (() => Promise<void>) | undefined;
     let stopHeartbeat: (() => void) | undefined;
+    let closeHealth: (() => Promise<void>) | undefined;
     // Capture task before installing control: stop() clears runner.task().
     const task = runner.task();
     try {
       if (process.platform === 'win32') closeControl = await startRuntimeControl(() => stopping ? 'stopping' : 'ready', stop);
-      stopHeartbeat = startHeartbeat(c.HEALTHCHECK_PING_URL, c.HEALTHCHECK_INTERVAL_SECONDS, logger);
+      closeHealth = await startHealthServer(health);
+      stopHeartbeat = startHeartbeat(c.HEALTHCHECK_PING_URL, c.HEALTHCHECK_INTERVAL_SECONDS, logger, fetch, async () => (await health.snapshot()).ready);
       logger.info({ username: bot.botInfo.username, providers: providers.map(p => p.name) }, 'English tutor bot started');
       await task;
       if (lockLost) throw new RuntimeError('PostgreSQL polling lock was lost. Restart after restoring the database connection.');
     } finally {
       clearInterval(cleanupTimer);
+      clearInterval(backupTimer);
       process.removeListener('SIGINT', stop);
       process.removeListener('SIGTERM', stop);
       stop();
       await stopping;
       await closeControl?.();
       stopHeartbeat?.();
+      await closeHealth?.();
       stopRunner = undefined;
     }
   } finally {

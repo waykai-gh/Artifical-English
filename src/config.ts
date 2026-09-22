@@ -7,7 +7,7 @@ const integer = (fallback: number, min: number, max: number) => z.preprocess(
   z.coerce.number().int().min(min).max(max),
 );
 const telegramIds = z.string().default('').refine(v => !v.trim() || v.split(',').every(id => /^\d+$/.test(id.trim()) && Number.isSafeInteger(Number(id)) && Number(id) > 0), 'Expected comma-separated Telegram user IDs');
-const envSchema = z.object({
+export const envSchema = z.object({
   BOT_TOKEN: z.string().regex(/^\d+:[A-Za-z0-9_-]{20,}$/, 'Invalid Telegram bot token'),
   DATABASE_URL: z.string().url().refine(v => /^postgres(?:ql)?:\/\//.test(v), 'Expected a PostgreSQL URL'),
   PUBLIC_BOT: z.enum(['true', 'false']).default('true'),
@@ -19,6 +19,7 @@ const envSchema = z.object({
   ALERT_BUDGET_PERCENT: integer(80, 1, 100),
   HEALTHCHECK_PING_URL: z.string().trim().default('').refine(value => !value || /^https:\/\//i.test(value), 'Expected an HTTPS healthcheck URL'),
   HEALTHCHECK_INTERVAL_SECONDS: integer(60, 30, 3600),
+  BACKUP_STATUS_DIR: z.string().default(''),
   GROQ_DAILY_TOKEN_BUDGET: integer(200000, 0, 1000000000),
   CLOUDFLARE_DAILY_NEURON_BUDGET: integer(10000, 0, 1000000000),
   CLOUDFLARE_INPUT_NEURONS_PER_MILLION: integer(4625, 0, 1000000000),
@@ -51,6 +52,10 @@ const envSchema = z.object({
   VOCABULARY_LIMIT: integer(1000, 1, 10000),
   RETENTION_DAYS: integer(30, 1, 365),
   DAILY_REQUEST_LIMIT: integer(100, 1, 10000),
+  GLOBAL_DAILY_REQUEST_LIMIT: integer(500, 1, 100000),
+  GLOBAL_MINUTE_REQUEST_LIMIT: integer(30, 1, 10000),
+  UPDATE_CONCURRENCY: integer(2, 1, 8),
+  SECURITY_HMAC_KEY: z.string().min(32),
   REQUEST_COOLDOWN_SECONDS: integer(4, 0, 3600),
   PROVIDER_TIMEOUT_MS: integer(30000, 1000, 60000),
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error', 'silent']).default('info'),

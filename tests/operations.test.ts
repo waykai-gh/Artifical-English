@@ -5,6 +5,20 @@ const failure = { provider: 'groq' as const, feature: 'chat' as const, outcome: 
 const success = { ...failure, outcome: 'success' as const, statusCode: 0, usage: { inputTokens: 100, outputTokens: 20 } };
 
 describe('operations monitoring', () => {
+  it('detects remote voice degradation across its ten-minute retry cooldown', async () => {
+    let now = Date.now();
+    const send = vi.fn().mockResolvedValue(undefined);
+    const monitor = new OperationsMonitor({ recordAiAttempt: vi.fn(), providerDayUsage: vi.fn() }, send, {warn:vi.fn()},
+      {enabled:true, adminIds:[1], transientFailureThreshold:3, cooldownMinutes:30, budgetAlertPercent:80, budgets:{}}, () => now);
+    for(let i=0;i<3;i++) { await monitor.noteSpeechResult('tts-remote', false); now += 600_000; }
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(monitor.servicesHealthy()).toBe(true);
+    await monitor.noteSpeechResult('tts-remote', true);
+    expect(send).toHaveBeenCalledTimes(2);
+    await monitor.noteSpeechResult('tts-remote', false);
+    expect(send).toHaveBeenCalledTimes(2);
+  });
+
   it('alerts on a sustained anomaly, suppresses repeats and reports recovery', async () => {
     let now = 1_000;
     const send = vi.fn().mockResolvedValue(undefined);

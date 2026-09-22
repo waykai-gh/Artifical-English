@@ -15,7 +15,7 @@ import { consentDeclinedScreen, consentScreen, dataScreen, dictionaryScreen, gui
 import { showScreen } from './ui/messages.js';
 
 export const commands = publicCommands;
-export const CONSENT_VERSION = '2026-09-20.2';
+export const CONSENT_VERSION = '2026-09-21.1';
 
 export function operationsText(stats: OperationsStats, c: Config): string {
   const providerLines = stats.providersToday.length
@@ -53,6 +53,7 @@ function privacyText(c: Config): string {
 Владелец бота может просматривать сохранённые настройки, словарь и последние реплики для поддержки. Доступ есть только у владельца.
 
 /forget удаляет данные из базы бота, но не копии Telegram, резервные копии или уже обработанные данные внешних сервисов.
+Для защиты квот до 48 часов остаётся счётчик запросов с кодом HMAC вместо Telegram ID. /forget не обнуляет лимиты. Обращения владельца к данным фиксируются в журнале на 90 дней без текстов сообщений и открытых Telegram ID.
 
 Продукт создан с помощью ИИ; ответы могут содержать ошибки.`;
 }
@@ -134,16 +135,18 @@ export function createBot(c: Config, deps: BotDependencies): Bot {
   });
 
   bot.command('admin', async ctx => {
-    if (!admins.has(String(ctx.from!.id))) { await ctx.reply('Команда недоступна.'); return; }
+    if (!admins.has(String(ctx.from!.id))) { await store.auditAdminAccess(ctx.from!.id, 'denied'); await ctx.reply('Команда недоступна.'); return; }
     const reference = ctx.match.trim();
     if (reference) {
       const userId = Number(reference);
       if (!/^\d+$/.test(reference) || !Number.isSafeInteger(userId) || userId < 1) { await ctx.reply('Формат: /admin Telegram_ID'); return; }
+      await store.auditAdminAccess(ctx.from!.id, 'user', userId);
       const user = await store.adminUser(userId);
       if (!user) { await ctx.reply('Пользователь с таким Telegram ID не найден.'); return; }
       await showScreen(ctx, adminUserScreen(user, 1));
       return;
     }
+    await store.auditAdminAccess(ctx.from!.id, 'dashboard');
     await showScreen(ctx, adminDashboardScreen(await store.operationsStats(), c));
   });
 
@@ -151,18 +154,21 @@ export function createBot(c: Config, deps: BotDependencies): Bot {
     const data = ctx.callbackQuery.data;
     if (!data.startsWith('admin:')) { await next(); return; }
     await ctx.answerCallbackQuery().catch(() => undefined);
-    if (!admins.has(String(ctx.from!.id))) { await ctx.reply('Команда недоступна.'); return; }
+    if (!admins.has(String(ctx.from!.id))) { await store.auditAdminAccess(ctx.from!.id, 'denied'); await ctx.reply('Команда недоступна.'); return; }
     const [, action, arg, extra] = data.split(':');
-    if (action === 'dashboard') { await showScreen(ctx, adminDashboardScreen(await store.operationsStats(), c)); return; }
+    if (action === 'dashboard') { await store.auditAdminAccess(ctx.from!.id, 'dashboard'); await showScreen(ctx, adminDashboardScreen(await store.operationsStats(), c)); return; }
     if (action === 'users') {
       const page = Number(arg ?? '1');
       if (!Number.isSafeInteger(page) || page < 1) return;
+      await store.auditAdminAccess(ctx.from!.id, 'users');
       await showScreen(ctx, adminUsersScreen(await store.adminUsers(page)));
       return;
     }
     const userId = Number(arg);
     const page = Number(extra ?? '1');
     if (!Number.isSafeInteger(userId) || userId < 1 || !Number.isSafeInteger(page) || page < 1) return;
+    if (action !== 'user' && action !== 'history' && action !== 'words') return;
+    await store.auditAdminAccess(ctx.from!.id, action, userId);
     const user = await store.adminUser(userId);
     if (!user) { await showScreen(ctx, { text: 'Пользователь больше не найден.', keyboard: new InlineKeyboard().text('‹ Пользователи', `admin:users:${page}`) }); return; }
     if (action === 'user') { await showScreen(ctx, adminUserScreen(user, page)); return; }
@@ -254,8 +260,8 @@ export function createBot(c: Config, deps: BotDependencies): Bot {
     if (!reference) { await ctx.reply('Укажи номер или точное выражение из словаря. Например: /word 12 или /word take off'); return; }
     const item = await store.findVocabulary(ctx.from!.id, reference);
     if (!item) { await ctx.reply('Такой записи в словаре нет. Посмотреть сохранённые слова: /words'); return; }
-    if (!await store.claimRequest(ctx.from!.id, c.DAILY_REQUEST_LIMIT, c.REQUEST_COOLDOWN_SECONDS)) {
-      await ctx.reply(`Слишком частые запросы или достигнут лимит ${c.DAILY_REQUEST_LIMIT} обращений в день (UTC). Пауза между запросами — ${c.REQUEST_COOLDOWN_SECONDS} с.`);
+    if (!await store.claimRequest(ctx.from!.id, c.DAILY_REQUEST_LIMIT, c.REQUEST_COOLDOWN_SECONDS, c.GLOBAL_DAILY_REQUEST_LIMIT, c.GLOBAL_MINUTE_REQUEST_LIMIT)) {
+      await ctx.reply(`Сейчас действует ограничение частоты или дневной лимит: до ${c.DAILY_REQUEST_LIMIT} обращений на человека, а также общий лимит бота. Попробуй позже; дневные лимиты обновляются в 00:00 UTC.`);
       return;
     }
     await withTyping(ctx, async () => {
@@ -433,8 +439,8 @@ export function createBot(c: Config, deps: BotDependencies): Bot {
       if (!Number.isSafeInteger(id) || id < 1) return;
       const item = await store.findVocabulary(userId, String(id));
       if (!item) { await showScreen(ctx, dictionaryScreen(await store.listVocabulary(userId, page))); return; }
-      if (!await store.claimRequest(userId, c.DAILY_REQUEST_LIMIT, c.REQUEST_COOLDOWN_SECONDS)) {
-        await ctx.reply(`Слишком частые запросы или достигнут лимит ${c.DAILY_REQUEST_LIMIT} обращений в день (UTC).`);
+      if (!await store.claimRequest(userId, c.DAILY_REQUEST_LIMIT, c.REQUEST_COOLDOWN_SECONDS, c.GLOBAL_DAILY_REQUEST_LIMIT, c.GLOBAL_MINUTE_REQUEST_LIMIT)) {
+        await ctx.reply(`Сейчас действует ограничение частоты или дневной лимит: до ${c.DAILY_REQUEST_LIMIT} обращений на человека, а также общий лимит бота. Попробуй позже; дневные лимиты обновляются в 00:00 UTC.`);
         return;
       }
       await withTyping(ctx, async () => {
@@ -517,8 +523,8 @@ export function createBot(c: Config, deps: BotDependencies): Bot {
     if (audio && !speech.canTranscribe) { await ctx.reply('Распознавание голоса требует ключ Groq или Gemini. Пока можно написать текстом.'); return; }
     const settings = await store.settings(userId);
     if (await store.hasTurn(userId, ctx.update.update_id)) return;
-    if (!await store.claimRequest(userId, c.DAILY_REQUEST_LIMIT, c.REQUEST_COOLDOWN_SECONDS)) {
-      await ctx.reply(`Слишком частые запросы или достигнут лимит ${c.DAILY_REQUEST_LIMIT} обращений в день (UTC). Пауза между запросами — ${c.REQUEST_COOLDOWN_SECONDS} с.`); return;
+    if (!await store.claimRequest(userId, c.DAILY_REQUEST_LIMIT, c.REQUEST_COOLDOWN_SECONDS, c.GLOBAL_DAILY_REQUEST_LIMIT, c.GLOBAL_MINUTE_REQUEST_LIMIT)) {
+      await ctx.reply(`Сейчас действует ограничение частоты или дневной лимит: до ${c.DAILY_REQUEST_LIMIT} обращений на человека, а также общий лимит бота. Попробуй позже; дневные лимиты обновляются в 00:00 UTC.`); return;
     }
     await withTyping(ctx, async () => {
       let text = message.text?.trim() ?? '';

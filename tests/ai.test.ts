@@ -55,6 +55,7 @@ describe('tutor output and settings', () => {
   });
   it('supports existing keys without allowing arbitrary credential destinations', () => {
     const c = readConfig({ BOT_TOKEN: `123456:${'x'.repeat(35)}`, DATABASE_URL: 'postgresql://localhost/test',
+      SECURITY_HMAC_KEY: 'test-only-do-not-use-in-production',
       LLM_PROVIDER_NAME: 'groq', LLM_API_KEY: 'old-groq', LLM_MODEL: 'openai/gpt-oss-120b',
       LLM_FALLBACK_PROVIDER_NAME: 'cloudflare', LLM_FALLBACK_API_KEY: 'old-cf',
       LLM_FALLBACK_API_URL: `https://api.cloudflare.com/client/v4/accounts/${'a'.repeat(32)}/ai/run/test`,

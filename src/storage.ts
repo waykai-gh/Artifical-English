@@ -1,4 +1,5 @@
 import { Pool } from 'pg';
+import { createHmac } from 'node:crypto';
 import { answerSchema, settingsSchema, type AiAttempt, type Answer, type Message, type ProviderName, type Settings } from './domain.js';
 import { pendingActionSchema, type PendingAction, type UiState } from './ui-state.js';
 
@@ -32,6 +33,49 @@ CREATE TABLE IF NOT EXISTS request_usage (
   requests INTEGER NOT NULL,
   last_request TIMESTAMPTZ NOT NULL
 );
+CREATE TABLE IF NOT EXISTS request_limits (
+  subject TEXT NOT NULL,
+  day DATE NOT NULL,
+  requests INTEGER NOT NULL,
+  last_request TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (subject, day)
+);
+CREATE TABLE IF NOT EXISTS global_request_limits (
+  day DATE PRIMARY KEY,
+  requests INTEGER NOT NULL DEFAULT 0,
+  minute TIMESTAMPTZ NOT NULL DEFAULT date_trunc('minute', now()),
+  minute_requests INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS admin_access_audit (
+  id BIGSERIAL PRIMARY KEY,
+  actor TEXT NOT NULL,
+  target TEXT,
+  action TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS admin_access_audit_created ON admin_access_audit(created_at);
+CREATE OR REPLACE FUNCTION claim_limited_request(p_subject TEXT, p_limit INTEGER, p_cooldown INTEGER, p_global_limit INTEGER, p_minute_limit INTEGER)
+RETURNS BOOLEAN LANGUAGE plpgsql VOLATILE AS $$
+DECLARE
+  today DATE := (now() AT TIME ZONE 'UTC')::date;
+  current_minute TIMESTAMPTZ := date_trunc('minute', now());
+  global_usage global_request_limits%ROWTYPE;
+BEGIN
+  INSERT INTO global_request_limits(day) VALUES (today) ON CONFLICT DO NOTHING;
+  SELECT * INTO global_usage FROM global_request_limits WHERE day = today FOR UPDATE;
+  IF global_usage.requests >= p_global_limit OR
+    (global_usage.minute = current_minute AND global_usage.minute_requests >= p_minute_limit) THEN RETURN FALSE; END IF;
+  IF EXISTS (SELECT 1 FROM request_limits WHERE subject = p_subject AND day >= today - 1
+    AND last_request > now() - p_cooldown * interval '1 second') THEN RETURN FALSE; END IF;
+  INSERT INTO request_limits(subject, day, requests, last_request) VALUES (p_subject, today, 1, now())
+    ON CONFLICT (subject, day) DO UPDATE SET requests = request_limits.requests + 1, last_request = now()
+    WHERE request_limits.requests < p_limit AND request_limits.last_request <= now() - p_cooldown * interval '1 second';
+  IF NOT FOUND THEN RETURN FALSE; END IF;
+  UPDATE global_request_limits SET requests = requests + 1, minute = current_minute,
+    minute_requests = CASE WHEN minute = current_minute THEN minute_requests + 1 ELSE 1 END WHERE day = today;
+  RETURN TRUE;
+END;
+$$;
 CREATE TABLE IF NOT EXISTS vocabulary_items (
   id BIGSERIAL PRIMARY KEY,
   user_id BIGINT NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
@@ -131,7 +175,32 @@ export async function migrate(pool: Pool): Promise<void> {
 }
 
 export class Store {
-  constructor(private readonly db: Database, private readonly initial: Settings, private readonly historyTurns: number, private readonly retentionDays: number, private readonly historyMaxChars = 6000) {}
+  constructor(private readonly db: Database, private readonly initial: Settings, private readonly historyTurns: number, private readonly retentionDays: number, private readonly historyMaxChars: number, private readonly securityKey: string) {
+    if (securityKey.length < 32) throw new Error('A stable security HMAC key is required');
+  }
+
+  private subject(userId: number, purpose: 'limits' | 'audit'): string {
+    return createHmac('sha256', this.securityKey).update(`${purpose}:${userId}`).digest('hex');
+  }
+
+  /** Copy existing counters before polling starts so upgrading does not reset quotas. */
+  async migrateLegacyLimits(): Promise<void> {
+    const legacy = await this.db.query("SELECT user_id, day::text, requests, last_request FROM request_usage WHERE day >= (now() AT TIME ZONE 'UTC')::date - 1");
+    for (const row of legacy.rows) {
+      await this.db.query(`INSERT INTO request_limits(subject, day, requests, last_request) VALUES ($1, $2, $3, $4)
+        ON CONFLICT (subject, day) DO UPDATE SET requests = greatest(request_limits.requests, EXCLUDED.requests),
+        last_request = greatest(request_limits.last_request, EXCLUDED.last_request)`,
+      [this.subject(Number(row.user_id), 'limits'), row.day, row.requests, row.last_request]);
+    }
+    await this.db.query(`INSERT INTO global_request_limits(day, requests) SELECT day, sum(requests)::int FROM request_usage GROUP BY day
+      ON CONFLICT (day) DO UPDATE SET requests = greatest(global_request_limits.requests, EXCLUDED.requests)`);
+  }
+
+  /** Record before reading support data; if auditing is unavailable, deny the read. */
+  async auditAdminAccess(actor: number, action: 'dashboard' | 'users' | 'user' | 'history' | 'words' | 'denied', target?: number): Promise<void> {
+    await this.db.query('INSERT INTO admin_access_audit(actor, target, action) VALUES ($1, $2, $3)',
+      [this.subject(actor, 'audit'), target === undefined ? null : this.subject(target, 'audit'), action]);
+  }
 
   async hasConsent(userId: number, version: string): Promise<boolean> {
     const result = await this.db.query('SELECT consent_version FROM app_users WHERE id = $1', [userId]);
@@ -197,17 +266,10 @@ export class Store {
     [userId, updateId, text, JSON.stringify(answerSchema.parse(answer)), provider]);
   }
 
-  async claimRequest(userId: number, dailyLimit: number, cooldownSeconds: number): Promise<boolean> {
-    const result = await this.db.query(`INSERT INTO request_usage(user_id, day, requests, last_request)
-      VALUES ($1, (now() AT TIME ZONE 'UTC')::date, 1, now())
-      ON CONFLICT (user_id) DO UPDATE SET
-        day = EXCLUDED.day,
-        requests = CASE WHEN request_usage.day = EXCLUDED.day THEN request_usage.requests + 1 ELSE 1 END,
-        last_request = now()
-      WHERE (request_usage.day <> EXCLUDED.day OR request_usage.requests < $2)
-        AND request_usage.last_request <= now() - $3 * interval '1 second'
-      RETURNING user_id`, [userId, dailyLimit, cooldownSeconds]);
-    return result.rows.length > 0;
+  async claimRequest(userId: number, dailyLimit: number, cooldownSeconds: number, globalLimit = 500, minuteLimit = 30): Promise<boolean> {
+    const result = await this.db.query('SELECT claim_limited_request($1, $2, $3, $4, $5) AS allowed',
+      [this.subject(userId, 'limits'), dailyLimit, cooldownSeconds, globalLimit, minuteLimit]);
+    return result.rows[0]?.allowed === true;
   }
 
   async clear(userId: number): Promise<void> {
@@ -309,6 +371,9 @@ export class Store {
   async cleanup(): Promise<void> {
     await this.db.query("DELETE FROM turns WHERE created_at <= now() - $1 * interval '1 day'", [this.retentionDays]);
     await this.db.query("DELETE FROM request_usage WHERE day < (now() AT TIME ZONE 'UTC')::date - 2");
+    await this.db.query("DELETE FROM request_limits WHERE day < (now() AT TIME ZONE 'UTC')::date - 1");
+    await this.db.query("DELETE FROM global_request_limits WHERE day < (now() AT TIME ZONE 'UTC')::date - 1");
+    await this.db.query("DELETE FROM admin_access_audit WHERE created_at < now() - interval '90 days'");
     await this.db.query("UPDATE app_ui_state SET pending = NULL WHERE pending IS NOT NULL AND (pending->>'expiresAt')::timestamptz <= now()");
     await this.db.query("DELETE FROM ai_metrics_hourly WHERE bucket < now() - interval '90 days'");
   }
@@ -414,7 +479,8 @@ export class Store {
   async adminRecentTurns(userId: number, limit = 5): Promise<AdminTurn[]> {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10) throw new Error('Invalid admin history limit');
     const result = await this.db.query(`SELECT user_text, answer, provider, created_at FROM turns
-      WHERE user_id = $1 ORDER BY id DESC LIMIT $2`, [userId, limit]);
+      WHERE user_id = $1 AND created_at > now() - $3 * interval '1 day'
+      ORDER BY id DESC LIMIT $2`, [userId, limit, this.retentionDays]);
     return result.rows.reverse().map(row => {
       const answer = answerSchema.parse(row.answer);
       return { userText: String(row.user_text), reply: answer.reply, corrections: answer.corrections.length,

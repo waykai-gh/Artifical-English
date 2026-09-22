@@ -25,6 +25,10 @@ export class OperationsMonitor implements AiObserver {
   private readonly failures = new Map<string, FailureWindow>();
   private readonly activeIncidents = new Set<string>();
   private readonly lastSent = new Map<string, number>();
+  private readonly unavailable = new Set<string>();
+  private readonly maintenanceFailures = new Map<string, number>();
+
+  servicesHealthy(): boolean { return this.unavailable.size === 0; }
 
   constructor(
     private readonly store: Pick<Store, 'recordAiAttempt' | 'providerDayUsage'>,
@@ -39,11 +43,12 @@ export class OperationsMonitor implements AiObserver {
     catch { this.logger.warn('Operational AI metric could not be stored'); }
 
     if (event.outcome === 'success') {
+      this.unavailable.delete(`ai:${event.feature}`);
       this.failures.delete(`provider:${event.provider}`);
-      const recovered = this.activeIncidents.has(`provider:${event.provider}`) || this.activeIncidents.has(`provider-config:${event.provider}`) || this.activeIncidents.has('ai:all');
+      const recovered = this.activeIncidents.has(`provider:${event.provider}`) || this.activeIncidents.has(`provider-config:${event.provider}`) || this.activeIncidents.has(`ai:${event.feature}`);
       this.activeIncidents.delete(`provider:${event.provider}`);
       this.activeIncidents.delete(`provider-config:${event.provider}`);
-      this.activeIncidents.delete('ai:all');
+      this.activeIncidents.delete(`ai:${event.feature}`);
       if (recovered) await this.sendRecovery(`AI-провайдер ${event.provider} снова отвечает.`);
       await this.checkBudget(event.provider);
       return;
@@ -63,7 +68,8 @@ export class OperationsMonitor implements AiObserver {
   }
 
   async onAiExhausted(feature: AiFeature): Promise<void> {
-    await this.alert('ai:all',
+    this.unavailable.add(`ai:${feature}`);
+    await this.alert(`ai:${feature}`,
       `🚨 Недоступны все AI-провайдеры\nНе выполнен запрос: ${feature === 'chat' ? 'диалог' : 'словарь'}. Пользователи уже получают ошибку — нужна проверка квот и ключей.`);
   }
 
@@ -81,9 +87,36 @@ export class OperationsMonitor implements AiObserver {
 
   async noteMaintenanceError(task: string): Promise<void> {
     const key = `maintenance:${task}`;
-    const count = this.noteFailure(key);
-    if (count >= this.options.transientFailureThreshold) {
-      await this.alert(key, `⚠️ Служебная задача «${task}» завершилась ошибкой ${count} раз за 5 минут.`);
+    const count = (this.maintenanceFailures.get(key) ?? 0) + 1;
+    this.maintenanceFailures.set(key, count);
+    this.unavailable.add(key);
+    await this.alert(key, `⚠️ Служебная задача «${task}»: ${count} последовательных сбоев. Проверь хранение и очистку данных.`);
+  }
+
+  async noteMaintenanceSuccess(task: string): Promise<void> {
+    const key = `maintenance:${task}`;
+    this.maintenanceFailures.delete(key);
+    this.unavailable.delete(key);
+    if (this.activeIncidents.delete(key)) await this.sendRecovery(`Служебная задача «${task}» снова выполняется.`);
+  }
+
+  async noteSpeechResult(feature: 'stt' | 'tts' | 'tts-remote', success: boolean): Promise<void> {
+    const key = `speech:${feature}`;
+    if (success) {
+      this.failures.delete(key);
+      this.maintenanceFailures.delete(key);
+      this.unavailable.delete(key);
+      if (this.activeIncidents.delete(key)) await this.sendRecovery(`Голосовая функция ${feature} восстановлена.`);
+      return;
+    }
+    // Remote TTS can degrade while a working local voice keeps overall service healthy.
+    if (feature !== 'tts-remote') this.unavailable.add(key);
+    // Remote TTS retries only every 10 minutes; a five-minute window would
+    // never reach its threshold. Count consecutive remote attempts instead.
+    const count = feature === 'tts-remote' ? (this.maintenanceFailures.get(key) ?? 0) + 1 : this.noteFailure(key);
+    if (feature === 'tts-remote') this.maintenanceFailures.set(key, count);
+    if (feature !== 'tts-remote' || count >= this.options.transientFailureThreshold) {
+      await this.alert(key, `⚠️ Голосовая функция ${feature} недоступна. Проверь API и обработку аудио. Текстовый диалог может продолжать работать.`);
     }
   }
 
@@ -131,9 +164,8 @@ export class OperationsMonitor implements AiObserver {
     if (!this.canAlert()) return;
     const last = this.lastSent.get(key);
     if (last !== undefined && this.now() - last < this.options.cooldownMinutes * 60_000) return;
-    this.lastSent.set(key, this.now());
     this.activeIncidents.add(key);
-    await this.broadcast(text);
+    if (await this.broadcast(text)) this.lastSent.set(key, this.now());
   }
 
   private async sendRecovery(text: string): Promise<void> {
@@ -145,9 +177,10 @@ export class OperationsMonitor implements AiObserver {
     return this.options.enabled && this.options.adminIds.length > 0;
   }
 
-  private async broadcast(text: string): Promise<void> {
+  private async broadcast(text: string): Promise<boolean> {
     const results = await Promise.allSettled(this.options.adminIds.map(chatId => this.send(chatId, text)));
     if (results.some(result => result.status === 'rejected')) this.logger.warn('One or more Telegram operational alerts could not be delivered');
+    return results.every(result => result.status === 'fulfilled');
   }
 }
 
@@ -157,14 +190,20 @@ export function startHeartbeat(
   intervalSeconds: number,
   logger: Pick<Logger, 'warn'>,
   fetcher: typeof fetch = fetch,
+  healthy: () => Promise<boolean> = async () => false,
 ): () => void {
   if (!url) return () => undefined;
+  let pending = false;
   const ping = async () => {
+    if (pending) return;
+    pending = true;
     try {
+      if (!await healthy()) return;
       const response = await fetcher(url, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(5000) });
       await response.body?.cancel();
       if (!response.ok) logger.warn('External healthcheck rejected a heartbeat');
     } catch { logger.warn('External healthcheck heartbeat failed'); }
+    finally { pending = false; }
   };
   void ping();
   const timer = setInterval(() => { void ping(); }, intervalSeconds * 1000);

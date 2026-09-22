@@ -57,6 +57,17 @@ describe('Telegram conversation flow', () => {
     expect(menuKeyboard().inline_keyboard.flat().map(button => button.text)).not.toContain('💬 К разговору');
   });
 
+  it('fails closed when admin access cannot be audited and records rejected support access', async () => {
+    const h = await setup({ ADMIN_TELEGRAM_IDS: '1' });
+    const read = vi.spyOn(store, 'operationsStats');
+    vi.spyOn(store, 'auditAdminAccess').mockRejectedValueOnce(new Error('Synthetic audit failure'));
+    await h.send('/admin', 1);
+    expect(read).not.toHaveBeenCalled();
+    await h.click('admin:users:1', 2, 2);
+    expect((await db.query('SELECT action FROM admin_access_audit')).rows).toEqual([{ action: 'denied' }]);
+    expect(h.sent.at(-1)).toContain('недоступна');
+  });
+
   it('keeps the user-facing privacy notice short and provider-neutral', async () => {
     const h = await setup();
     await h.send('/privacy');

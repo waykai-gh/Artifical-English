@@ -12,8 +12,10 @@ Telegram-бот **Ellie** на TypeScript, grammY и PostgreSQL: свободн�
 
 ```powershell
 npm ci
-# Если .env ещё нет: скопируй .env.example в .env и заполни BOT_TOKEN и хотя бы один ключ ИИ.
-docker compose up -d db
+# Скопируй .env.example в .env. Заполни BOT_TOKEN, ключ ИИ, случайный
+# POSTGRES_PASSWORD (24+ символа), SECURITY_HMAC_KEY (32+) и локальный DATABASE_URL.
+node scripts/prepare-production.mjs
+docker compose --env-file deploy/compose.env up -d db
 npm run doctor
 npm run dev
 ```
@@ -21,7 +23,7 @@ npm run dev
 PostgreSQL опубликована только на `127.0.0.1:15432`; этот порт выбран, чтобы не конфликтовать с существующими службами Windows. `DATABASE_URL` для локального Node:
 
 ```dotenv
-DATABASE_URL=postgresql://english:english_local_only@localhost:15432/english
+DATABASE_URL=postgresql://english:YOUR_URL_ENCODED_PASSWORD@localhost:15432/english
 ```
 
 Схема БД создаётся автоматически при старте. Для отдельного запуска миграции: `npm run db:migrate`. Для собранного приложения: `npm run build`, затем `npm start`.
@@ -33,11 +35,16 @@ DATABASE_URL=postgresql://english:english_local_only@localhost:15432/english
 Полный запуск в контейнерах:
 
 ```powershell
-docker compose up -d --build
-docker compose logs -f bot
+node scripts/prepare-production.mjs
+docker compose --env-file deploy/compose.env up -d --build
+docker compose --env-file deploy/compose.env logs -f bot
 ```
 
-Внутри Compose бот обращается к `db:5432`; адрес БД из `.env` заменяется только для контейнера. Не запускай одновременно две копии с одним Telegram-токеном. `docker compose stop` останавливает контейнеры и сохраняет данные. Пароль `english_local_only` предназначен для локальной разработки; при установке на сервер задай свой `POSTGRES_PASSWORD` в `.env` до первого создания базы. Смена переменной не меняет пароль в уже созданном томе PostgreSQL.
+Внутри Compose бот обращается к `db:5432`. Подготовка создаёт `deploy/runtime.env` только с разрешёнными настройками приложения, отдельный файл пароля PostgreSQL и постоянный HMAC-ключ; файлы исключены из Git. Docker Compose 2.30+ читает runtime-файл в режиме `raw`, сохраняя символы `$`. Исходный `.env` с реквизитами SSH в контейнер не передаётся. Пустой или заведомо слабый пароль блокирует подготовку. Смена переменной не меняет пароль уже созданной базы: существующие пароли автоматически не заменяются.
+
+Не запускай две копии с одним Telegram-токеном. `docker compose --env-file deploy/compose.env stop` сохраняет данные. Для полного контейнерного запуска настрой резервные копии по [инструкции эксплуатации](docs/OPERATIONS.md): отсутствие свежей копии не мешает запуску, но вызывает операционный алерт.
+
+Общие ограничения: `GLOBAL_DAILY_REQUEST_LIMIT=500`, `GLOBAL_MINUTE_REQUEST_LIMIT=30`, `UPDATE_CONCURRENCY=2`. Один запрос резервирует квоту перед обработкой текста, аудио или объяснения слова. Счётчик пользователя использует HMAC и сохраняется после `/forget`, поэтому удаление профиля не обходит лимит. Это ограничение числа обращений, а не точный денежный бюджет: одна обработка может вызвать несколько AI/STT/TTS-провайдеров. Бесплатность дополнительно контролируется в аккаунтах сервисов.
 
 ## ИИ-сервисы и ключи
 

@@ -94,7 +94,7 @@ describe('PostgreSQL persistence', () => {
     await store.settings(1);
     const claims = await Promise.all([store.claimRequest(1, 1, 0), store.claimRequest(1, 1, 0)]);
     expect(claims.filter(Boolean)).toHaveLength(1);
-    await db.query("UPDATE request_usage SET day = day - 1, last_request = now() - interval '1 day' WHERE user_id = 1");
+    await db.query("UPDATE request_limits SET day = day - 1, last_request = now() - interval '1 day'");
     expect(await store.claimRequest(1, 1, 0)).toBe(true);
     expect(await store.claimRequest(1, 100, 10)).toBe(false);
   });
@@ -139,6 +139,7 @@ describe('PostgreSQL persistence', () => {
     await store.saveTurn(1, 1, 'expired', answer, 'groq');
     await db.query("UPDATE turns SET created_at = now() - interval '31 days' WHERE user_id = 1");
     expect(await store.history(1)).toEqual([]);
+    expect(await store.adminRecentTurns(1)).toEqual([]);
     await store.cleanup();
     expect(await store.hasTurn(1, 1)).toBe(false);
     await store.claimRequest(1, 100, 0);
@@ -146,6 +147,7 @@ describe('PostgreSQL persistence', () => {
     await store.saveVocabulary(1, 'remember me', 'запомни меня');
     await store.forget(1);
     expect((await db.query('SELECT * FROM request_usage')).rows).toEqual([]);
+    expect(await store.claimRequest(1, 1, 0)).toBe(false);
     expect((await db.query('SELECT * FROM turns')).rows).toEqual([]);
     expect((await db.query('SELECT * FROM app_users')).rows).toHaveLength(1);
     expect((await db.query('SELECT * FROM vocabulary_items')).rows).toEqual([]);
