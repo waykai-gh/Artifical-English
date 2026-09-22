@@ -2,6 +2,7 @@
 
 | UTC | Версия | Ревизия | Результат | Проверка |
 | --- | --- | --- | --- | --- |
+| 2026-09-22 08:38:31 | 1.1.1 | `6b63708` | Успешно: исправления аудита, изоляция конфигурации, защита квот, healthcheck и backup/restore; плановое переключение начато 08:37:51 UTC | CI прошёл 71 тест и release gates; Groq/голос OK, Cloudflare 429 зафиксирован отдельно; encrypted backup + isolated restore до и после миграции OK; внешняя копия на рабочей станции проверена; bot и DB healthy; `/ready` 200; restart count 0; свежих предупреждений/ошибок 0; PG loopback; три задания cron codex установлены; повторная проверка 08:40 UTC |
 | 2026-09-20 12:58 | 1.1.0 | `fac9b43` | Успешно: версия манифеста и внутренняя документация | Doctor: PostgreSQL, Telegram и ffmpeg OK; bot running; DB healthy; restart count 0; внешний heartbeat не настроен |
 | 2026-09-20 12:44 | 1.1.0 | `53ee8d3` | Успешно: упрощение A1, защита учебной роли, поддержка пользователей в `/admin` | Bot running, PostgreSQL healthy, restart count 0, старт без ошибок |
 | 2026-09-20 11:57 | 1.1.0-rc | `b297a7d` | Успешно: согласие, onboarding, статистика и Telegram-алерты | Контейнеры healthy/running, миграция применена |
